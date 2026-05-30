@@ -643,18 +643,21 @@ class PincerApp:
     def _parse_models(r): return [{"model":m.model,"size":m.size} for m in r.models] if hasattr(r,"models") else r.get("models",[])
     @staticmethod
     def _ga(o,k,d=None): return o.get(k,d) if isinstance(o,dict) else getattr(o,k,d)
+    
     @staticmethod
     def _chunk_c(c):
-        if hasattr(c,"message"): m=c.message;
-        if hasattr(m,"content"): return m.content or ""
-        if isinstance(c,dict): return c.get("message",{}).get("content","") or ""
+        m = getattr(c, "message", None)
+        if hasattr(m, "content"): return m.content or ""
+        if isinstance(c, dict): return c.get("message", {}).get("content", "") or ""
         return ""
+        
     @staticmethod
     def _chat_content(r):
-        if hasattr(r,"message"): m=r.message;
-        if hasattr(m,"content"): return m.content or ""
-        if isinstance(r,dict): return r.get("message",{}).get("content","") or ""
+        m = getattr(r, "message", None)
+        if hasattr(m, "content"): return m.content or ""
+        if isinstance(r, dict): return r.get("message", {}).get("content", "") or ""
         return ""
+        
     @staticmethod
     def _get_emb(r): return r.get("embedding",[]) if isinstance(r,dict) else getattr(r,"embedding",[])
     @staticmethod
@@ -906,25 +909,30 @@ class PincerApp:
     # ── Streaming (#1 markdown, #2 syntax) ────────────────────────────────
 
     def stream(self, msgs):
-        full=""; int_=False; ts=False; buf=""
+        full = ""; int_ = False; ts = False; buf = ""
         try:
-            self._gen=True
-            for ch in ollama.chat(model=self.model,messages=msgs,stream=True):
+            self._gen = True
+            for ch in ollama.chat(model=self.model, messages=msgs, stream=True):
                 if not self._gen: break
-                if self._ga(ch,"done",False): break
-                tok=self._chunk_c(ch)
+                if self._ga(ch, "done", False): break
+                tok = self._chunk_c(ch)
                 if not tok: continue
-                full+=tok
-                if not self.thinking: self.console.print(tok,end=""); continue
-                buf+=tok; ch2=True
+                full += tok
+                if not self.thinking:
+                    self.console.print(tok, end="")
+                    continue
+                
+                buf += tok
+                ch2 = True
                 while ch2:
-                    ch2=False
+                    ch2 = False
                     if not int_:
-                        oi=buf.find(THINK_TAG_OPEN)
-                        if oi!=-1:
-                            if oi>0: self.console.print(buf[:oi],end="")
-                            af=buf[oi+len(THINK_TAG_OPEN):]; gt=af.find(">")
-                                                        if gt != -1:
+                        oi = buf.find(THINK_TAG_OPEN)
+                        if oi != -1:
+                            if oi > 0: self.console.print(buf[:oi], end="")
+                            af = buf[oi + len(THINK_TAG_OPEN):]
+                            gt = af.find(">")
+                            if gt != -1:
                                 buf = af[gt + 1:]
                                 int_ = True
                                 if not ts and int_:
@@ -934,24 +942,36 @@ class PincerApp:
                             else:
                                 buf = buf[oi:]
                         else:
-                            pt=self._ptl(buf,THINK_TAG_OPEN); s=buf[:len(buf)-pt] if pt else buf
-                            if s: self.console.print(s,end="")
-                            buf=buf[len(s):]
+                            pt = self._ptl(buf, THINK_TAG_OPEN)
+                            s = buf[:len(buf)-pt] if pt else buf
+                            if s: self.console.print(s, end="")
+                            buf = buf[len(s):]
                     else:
-                        ci=buf.find(THINK_TAG_CLOSE)
-                        if ci!=-1:
-                            af=buf[ci+len(THINK_TAG_CLOSE):]; gt=af.find(">")
-                            if gt!=-1: buf=af[gt+1:]; int_=False; ch2=True
-                            else: buf=buf[ci:]
+                        ci = buf.find(THINK_TAG_CLOSE)
+                        if ci != -1:
+                            af = buf[ci + len(THINK_TAG_CLOSE):]
+                            gt = af.find(">")
+                            if gt != -1:
+                                buf = af[gt + 1:]
+                                int_ = False
+                                ch2 = True
+                            else:
+                                buf = buf[ci:]
                         else:
-                            pt=self._ptl(buf,THINK_TAG_CLOSE)
-                            buf=buf[-pt:] if pt else ""
-                if buf and not int_: self.console.print(buf,end="")
-            # #1: Render final output as markdown
+                            pt = self._ptl(buf, THINK_TAG_CLOSE)
+                            buf = buf[-pt:] if pt else ""
+                if buf and not int_:
+                    self.console.print(buf, end="")
             self.console.print()
-        except KeyboardInterrupt: self._gen=False; self._partial_resp=full; self.console.print("\n  ⏹ Stopped. Type /resume to continue.",style="yellow")
-        except Exception as e: self._gen=False; self.console.print(f"\n  ❌ {e}",style="bold red")
-        self._gen=False; return full
+        except KeyboardInterrupt:
+            self._gen = False
+            self._partial_resp = full
+            self.console.print("\n  ⏹ Stopped. Type /resume to continue.", style="yellow")
+        except Exception as e:
+            self._gen = False
+            self.console.print(f"\n  ❌ {e}", style="bold red")
+        self._gen = False
+        return full
 
     # ── Status bar ────────────────────────────────────────────────────────
 
@@ -1113,7 +1133,7 @@ class PincerApp:
 
     def cmd_resume_interrupt(self):
         if self._partial_resp:
-            self.console.print("  Continuing from interrupted response…",style=blue)
+            self.console.print("  Continuing from interrupted response…",style=BLUE)
             msgs=self.get_msgs()
             msgs.append({"role":"user","content":"Continue from where you left off."})
             self.console.print(); resp=self.stream(msgs); self.console.print()
