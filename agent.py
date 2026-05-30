@@ -924,10 +924,15 @@ class PincerApp:
                         if oi!=-1:
                             if oi>0: self.console.print(buf[:oi],end="")
                             af=buf[oi+len(THINK_TAG_OPEN):]; gt=af.find(">")
-                            if gt!=-1: buf=af[gt+1:]; int_=True
-                            if not ts and int_: self.console.print("  ● Thinking…",style=BLUE); ts=True
-                            ch2=True
-                            else: buf=buf[oi:]
+                                                        if gt != -1:
+                                buf = af[gt + 1:]
+                                int_ = True
+                                if not ts and int_:
+                                    self.console.print("  ● Thinking…", style=BLUE)
+                                    ts = True
+                                ch2 = True
+                            else:
+                                buf = buf[oi:]
                         else:
                             pt=self._ptl(buf,THINK_TAG_OPEN); s=buf[:len(buf)-pt] if pt else buf
                             if s: self.console.print(s,end="")
