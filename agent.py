@@ -1,1598 +1,2229 @@
 #!/usr/bin/env python3
-"""Pincer — professional local AI coding assistant.
-
-Professional terminal UI with blue theme, inspired by Claude Code.
-Phase 1: REPL, chat, context manager.
-Phase 2: File tools, sandboxed shell, permissions.
-Phase 3: Autonomous worker, planning, self-notes, checkpoints.
-Phase 4: PII scrubbing, file watching, voice, sessions, 50 feature suite.
+"""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║              🦞  P I N C E R  v2.1.0                        ║
+║         Autonomous Coding Agent — Blue Lobster Edition       ║
+║                                                              ║
+║  Architecture: Single-file Python CLI agent                  ║
+║  Primary Model: qwen3:8b (with tool calling)                ║
+║  Target: Mac M4 Air 16GB                                    ║
+║  Inspiration: Claude Code, OpenCode, MCP ecosystem           ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
-import os, re, sys, sqlite3, shutil, signal, argparse, asyncio, subprocess, \
-    tempfile, json, time, difflib, hashlib, threading, wave, struct
+import os, sys, re, json, time, uuid, math, signal, shutil, sqlite3
+import hashlib, textwrap, subprocess, difflib, asyncio
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple, Any
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
+from collections import deque
+from typing import Any, Optional
+from urllib.parse import quote as url_quote
 
+# ──────────────────────────────────────────────────────────────
+# SECTION 1: DEPENDENCY CHECK & AUTO-INSTALL
+# ──────────────────────────────────────────────────────────────
+
+REQUIRED_DEPS = {
+    'ollama': 'ollama>=0.4.0',
+    'prompt_toolkit': 'prompt_toolkit>=3.0',
+    'rich': 'rich>=13.0',
+    'httpx': 'httpx>=0.27',
+    'bs4': 'beautifulsoup4>=4.12',
+    'pygments': 'pygments>=2.17',
+}
+
+def ensure_dependencies():
+    missing = []
+    for mod, pkg in REQUIRED_DEPS.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"\033[38;5;39m🦞 Installing missing dependencies: {', '.join(missing)}\033[0m")
+        try:
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', '--quiet'] + missing,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("\033[38;5;39m🦞 Dependencies installed!\033[0m")
+        except subprocess.CalledProcessError:
+            print(f"\033[38;5;196m🦞 Failed. Run: pip install {' '.join(missing)}\033[0m")
+            sys.exit(1)
+
+ensure_dependencies()
+
+import ollama
+import httpx
+from bs4 import BeautifulSoup
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.completion import Completer, Completion
-from rich.console import Console, Group
-from rich.table import Table
-from rich.panel import Panel
+from prompt_toolkit.completion import WordCompleter, FuzzyWordCompleter
+from prompt_toolkit.formatted_text import FormattedText
+from rich.console import Console
 from rich.text import Text
-from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.table import Table
+from rich.tree import Tree
 from rich.syntax import Syntax
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-from rich.columns import Columns
-from rich.bar import Bar
+from rich.markdown import Markdown
 from rich.rule import Rule
-import questionary
-import ollama
+from rich.layout import Layout
+from rich.live import Live
+from rich.box import ROUNDED
+from rich.theme import Theme
+from pygments.lexers import guess_lexer_for_filename, TextLexer
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════════════
 
+# ──────────────────────────────────────────────────────────────
+# SECTION 2: CONSTANTS & DEEP OCEAN COLOR SYSTEM
+# ──────────────────────────────────────────────────────────────
+
+VERSION = "2.1.0"
+APP_NAME = "Pincer"
+MASCOT = "🦞"
 PINCER_DIR = Path.home() / ".pincer"
 DB_PATH = PINCER_DIR / "pincer.db"
 HISTORY_PATH = PINCER_DIR / "history"
-SESSIONS_DIR = PINCER_DIR / "sessions"
-PLAN_FILE = PINCER_DIR / "plan.md"
-POLICY_FILE = PINCER_DIR / "policy.json"
-MAX_TOKENS = 12000; COMPACT_THRESHOLD = 10000; CHARS_PER_TOKEN = 4
-DEFAULT_MODEL = "qwen3:8b"; EMBEDDING_MODEL = "nomic-embed-text"; EMBEDDING_DIM = 768
-MAX_TOOL_TOKENS = 1500; MAX_SHELL_PER_TASK = 50; MAX_RM_PER_TASK = 3
-MAX_WRITES_PER_TASK = 20; NO_PROGRESS_TIMEOUT = 1200; MAX_TASK_TIME = 7200
-HEARTBEAT_INTERVAL = 300; FILE_WATCH_INTERVAL = 3.0
+CONFIG_PATH = PINCER_DIR / "config.json"
+PINCER_MD = Path.cwd() / "PINCER.md"
 
-BANNER = "[bold blue]⬡ Pincer[/bold blue] [dim]v4.0 — local AI assistant[/dim]"
-BLUE = "blue"; DIM_BLUE = "dim blue"; BRIGHT_BLUE = "bright_blue"
+DEFAULT_MODEL = "qwen3:8b"
+DEFAULT_USER = "user"
+MAX_TURNS = 25
+MAX_CONTEXT_TOKENS = 12000
+SYSTEM_PROMPT_TOKENS = 500
+MEMORY_TOKENS = 1000
+TOOL_SCHEMA_TOKENS = 500
 
-THINK_TAG_OPEN = "<think"; THINK_TAG_CLOSE = "</think"
+THINK_OPEN = "<think" + ">"
+THINK_CLOSE = "</think" + ">"
 
-SAFE_CMDS = ["git","ls","pwd","mkdir","cat","head","tail","python","python3","pytest","node","npm install","pip install","cargo","make","echo","wc","find","grep","which","tree","diff","sort","uniq","tee","rg","ag"]
-ASK_CMDS = ["rm","mv","cp","chmod","chown","sudo","curl","wget","eval","exec","source","bash","sh","zsh","pip","npm","brew","docker","kill","pkill"]
-DENY_PATTERNS = [r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*\s+/$",r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*\s+/\*",r"^sudo\s+rm",r"^sudo\s+-\w*\s+rm",r"^mkfs",r"^dd\s+if=",r"curl\s+.*\|\s*(ba)?sh",r"wget\s+.*\|\s*(ba)?sh",r":\(\)\{.*;\}\s*;",r"^chmod\s+-R\s+777\s+/",r"^chmod\s+777\s+/"]
-FILE_READ_KW = {"read","show","cat","open","display","view","inspect","explain"}
-FILE_WRITE_KW = {"write","create","save","new file","add file"}
-FILE_EDIT_KW = {"edit","fix","refactor","change","update","modify","patch","rename"}
-SHELL_KW = {"run","execute","test","build","install","git","ls","mkdir","pip","npm","cargo","make","delete","remove","search","find"}
-FILE_EXT = {".py",".js",".ts",".tsx",".jsx",".rs",".go",".java",".c",".cpp",".h",".hpp",".rb",".php",".swift",".kt",".txt",".md",".json",".yaml",".yml",".toml",".cfg",".ini",".sh",".bash",".zsh",".fish",".sql",".html",".css",".scss",".vue",".svelte",".gitignore",".env",".csv",".xml",".lock"}
-MEMORY_FILES = ["CLAUDE.md","AGENTS.md","PINCER.md",".pincer.md"]
-BINARY_EXT = {".png",".jpg",".jpeg",".gif",".bmp",".ico",".webp",".mp3",".mp4",".wav",".avi",".mov",".mkv",".zip",".tar",".gz",".bz2",".xz",".7z",".rar",".pyc",".pyo",".so",".dylib",".dll",".exe",".woff",".woff2",".ttf",".eot",".otf",".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".sqlite",".db",".parquet"}
-SKIP_DIRS = {"node_modules",".git","__pycache__",".venv","venv","dist","build",".next",".nuxt","target",".tox",".mypy_cache",".pytest_cache"}
+C = {
+    'bg':            '#0F1629',
+    'bg_panel':      '#151D3B',
+    'bg_input':      '#1A2550',
+    'bg_hover':      '#1E3A6E',
+    'primary':       '#2563EB',
+    'primary_br':    '#3B82F6',
+    'accent':        '#60A5FA',
+    'accent_lt':     '#93C5FD',
+    'text':          '#93C5FD',
+    'text_dim':      '#64748B',
+    'text_bright':   '#DBEAFE',
+    'text_muted':    '#475569',
+    'thinking':      '#A78BFA',
+    'planning':      '#60A5FA',
+    'working':       '#3B82F6',
+    'searching':     '#06B6D4',
+    'reading':       '#8B5CF6',
+    'writing':       '#2563EB',
+    'error':         '#EF4444',
+    'success':       '#22C55E',
+    'warning':       '#F59E0B',
+    'info':          '#06B6D4',
+    'border':        '#1E3A6E',
+    'border_active': '#3B82F6',
+    'diff_add':      '#4ADE80',
+    'diff_add_bg':   '#052E16',
+    'diff_del':      '#F87171',
+    'diff_del_bg':   '#450A0A',
+    'diff_hunk':     '#1E3A6E',
+    'lobster':       '#2563EB',
+}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PII SCRUBBER (#1 of 50)
-# ═══════════════════════════════════════════════════════════════════════════════
+DEEP_OCEAN = Theme({
+    'primary':        C['primary'],
+    'primary.br':     C['primary_br'],
+    'accent':         C['accent'],
+    'thinking':       C['thinking'],
+    'planning':       C['planning'],
+    'working':        C['working'],
+    'searching':      C['searching'],
+    'reading':        C['reading'],
+    'writing':        C['writing'],
+    'error':          C['error'],
+    'success':        C['success'],
+    'warning':        C['warning'],
+    'info':           C['info'],
+    'text':           C['text'],
+    'text.dim':       C['text_dim'],
+    'text.bright':    C['text_bright'],
+    'text.muted':     C['text_muted'],
+    'lobster':        C['lobster'],
+    'border':         C['border'],
+    'border.active':  C['border_active'],
+})
 
-PII_PATTERNS = [
-    (re.compile(r'AKIA[0-9A-Z]{16}'), '[AWS_KEY]'),
-    (re.compile(r'ghp_[0-9a-zA-Z]{36}'), '[GITHUB_TOKEN]'),
-    (re.compile(r'gho_[0-9a-zA-Z]{36}'), '[GITHUB_OAUTH]'),
-    (re.compile(r'ghs_[0-9a-zA-Z]{36}'), '[GITHUB_SAML]'),
-    (re.compile(r'sk-[a-zA-Z0-9]{48}'), '[OPENAI_KEY]'),
-    (re.compile(r'eyJ[a-zA-Z0-9._-]+'), '[JWT]'),
-    (re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----'), '[PRIVATE_KEY]'),
-    (re.compile(r'(?:password|passwd|secret|token|api_key|apikey)\s*[:=]\s*["\']?[^\s"\']{8,}', re.I), '[CREDENTIAL]'),
-    (re.compile(r'(?:MONGO|DATABASE|DB)_URL\s*[:=]\s*["\']?[^\s"\']{10,}', re.I), '[DB_URL]'),
+ANSI = {
+    'reset':      '\033[0m',
+    'bold':       '\033[1m',
+    'dim':        '\033[2m',
+    'italic':     '\033[3m',
+    'underline':  '\033[4m',
+    'purple':     '\033[38;2;167;139;250m',
+    'blue':       '\033[38;2;59;130;246m',
+    'bright_blue':'\033[38;2;96;165;250m',
+    'cyan':       '\033[38;2;6;182;212m',
+    'green':      '\033[38;2;34;197;94m',
+    'red':        '\033[38;2;239;68;68m',
+    'amber':      '\033[38;2;245;158;11m',
+    'dim_blue':   '\033[38;2;100;116;139m',
+    'light_blue': '\033[38;2;147;197;253m',
+    'white':      '\033[38;2;219;234;254m',
+}
+
+TRUST_LEVELS = ['plan', 'default', 'acceptEdits', 'auto', 'dontAsk']
+LAYOUT_MODES = ['stream', 'panel', 'compact']
+
+DENY_PATTERNS = [
+    r'^rm\s+-[a-zA-Z]*f\s+/',
+    r'^mkfs',
+    r'^dd\s+if=',
+    r'curl\s+.*\|\s*(ba)?sh',
+    r':\(\)\{.*;\}\s*;',
+    r'^sudo\s+rm',
+    r'>\s*/etc/',
+    r'^chmod\s+-R\s+777\s+/',
+    r'^git\s+push\s+--force',
+    r'^dropdb',
+    r'^pip\s+uninstall\s+-y\s+(pip|setuptools)',
 ]
 
-def scrub_pii(text: str) -> str:
-    """#42: Strip PII/secrets from text before sending to LLM."""
-    for pattern, replacement in PII_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+SAFE_PATTERNS = [
+    r'^git\s+(status|log|diff|show|branch)',
+    r'^ls\s+.*',
+    r'^cat\s+.*',
+    r'^pwd$',
+    r'^python\s+.*\.py$',
+    r'^pytest\s+.*',
+    r'^pip\s+(list|show|freeze|install)',
+    r'^echo\s+.*',
+    r'^which\s+.*',
+    r'^head\s+.*',
+    r'^tail\s+.*',
+    r'^wc\s+.*',
+    r'^find\s+.*',
+    r'^grep\s+.*',
+    r'^du\s+.*',
+    r'^mkdir\s+.*',
+    r'^touch\s+.*',
+    r'^cp\s+.*',
+    r'^mv\s+.*',
+]
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAZY FILE COMPLETER (#8 of 50)
-# ═══════════════════════════════════════════════════════════════════════════════
 
-class LazyFileCompleter(Completer):
-    def __init__(self): self._paths = None; self._t = 0.0
-    def _scan(self):
-        ps = []
-        try:
-            for r, ds, fs in os.walk("."):
-                ds[:] = [d for d in ds if d not in SKIP_DIRS and not d.startswith(".")]
-                for f in fs:
-                    fp = os.path.join(r, f)
-                    if not any(fp.endswith(e) for e in BINARY_EXT): ps.append(fp)
-                    if len(ps) >= 300: return ps
-        except Exception: pass
-        return ps
-    def get_completions(self, document, complete_event):
-        if self._paths is None or time.time()-self._t > 30:
-            self._paths = self._scan(); self._t = time.time()
-        w = document.get_word_before_cursor()
-        if not w: return
-        for p in self._paths:
-            if w in p: yield Completion(p, start_position=-len(w))
+# ──────────────────────────────────────────────────────────────
+# SECTION 3: CONFIGURATION
+# ──────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TOOL RESULT
-# ═══════════════════════════════════════════════════════════════════════════════
+class PincerConfig:
+    DEFAULTS = {
+        'user_name': DEFAULT_USER,
+        'model': DEFAULT_MODEL,
+        'language': 'python',
+        'experience': 'Intermediate',
+        'trust_level': 'default',
+        'thinking_mode': 'auto',
+        'theme': 'deep_ocean',
+        'layout_mode': 'stream',
+        'auto_approve_reads': True,
+        'max_shell_timeout': 120,
+        'max_file_size': 1_000_000,
+        'max_output_lines': 200,
+        'web_search_enabled': True,
+        'scrape_enabled': False,
+        'sound_notifications': True,
+        'first_run': True,
+    }
 
-@dataclass
-class ToolResult:
-    success: bool; output: str; tool_name: str; command: str = ""; error: str = ""
+    def __init__(self):
+        PINCER_DIR.mkdir(parents=True, exist_ok=True)
+        self.data = dict(self.DEFAULTS)
+        self._load()
+
+    def _load(self):
+        if CONFIG_PATH.exists():
+            try:
+                with open(CONFIG_PATH) as f:
+                    self.data.update(json.load(f))
+            except Exception:
+                pass
+
+    def save(self):
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(self.data, f, indent=2)
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.save()
+
     @property
-    def display(self): return self.output if self.success else (self.error or "Error")
-    def truncated(self, mc=6000): return self.output[:mc] + (f"\n... [{len(self.output)-mc} chars cut]" if len(self.output)>mc else self.output)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PERMISSION MANAGER + POLICY (#41 of 50)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class PermissionManager:
-    def __init__(self, allowed=None):
-        self._always = allowed or []; self._policy = {}
-    def load_policy(self, path: Path):
-        if path.exists():
-            try: self._policy = json.loads(path.read_text())
-            except: pass
-    def check(self, cmd, cwd):
-        s = cmd.strip()
-        for p in DENY_PATTERNS:
-            if re.search(p, s, re.I): return "deny"
-        for rule in self._policy.get("deny", []):
-            if re.search(rule, s): return "deny"
-        for p in self._always:
-            if s == p or s.startswith(p+" "): return "allow"
-        for p in SAFE_CMDS:
-            if s == p or s.startswith(p+" "):
-                if any(x.startswith("/") and not x.startswith(cwd) for x in s.split()): return "ask"
-                return "allow"
-        for p in ASK_CMDS:
-            if s == p or s.startswith(p+" "): return "ask"
-        return "ask"
-    def add_allowed(self, cmd):
-        p = " ".join(cmd.split()[:2])
-        if p not in self._always: self._always.append(p)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FILE TOOLS (#19 indentation-agnostic, #31 verification)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class FileTools:
-    @staticmethod
-    def read_file(path):
-        try:
-            p = Path(path).expanduser().resolve()
-            if not p.exists(): return ToolResult(False,"","read_file",path,f"Not found: {p}")
-            if p.is_dir(): return ToolResult(False,"","read_file",path,f"Directory: {p}")
-            if p.stat().st_size > 500_000: return ToolResult(False,"","read_file",path,f"Too large ({p.stat().st_size//1024}KB)")
-            with open(p,"r",encoding="utf-8",errors="replace") as f: content = f.read()
-            num = "".join(f"  {i+1:>4} │ {l}" for i,l in enumerate(content.splitlines(True)))
-            return ToolResult(True, num, "read_file", path)
-        except Exception as e: return ToolResult(False,"","read_file",path,str(e))
-
-    @staticmethod
-    def write_file(path, content):
-        try:
-            p = Path(path).expanduser().resolve(); p.parent.mkdir(parents=True, exist_ok=True)
-            with open(p,"w",encoding="utf-8") as f: f.write(content)
-            lc = content.count("\n")+(1 if content and not content.endswith("\n") else 0)
-            return ToolResult(True,f"✓ Wrote {lc} lines → {p}","write_file",path)
-        except Exception as e: return ToolResult(False,"","write_file",path,str(e))
-
-    @staticmethod
-    def edit_file(path, old, new):
-        try:
-            p = Path(path).expanduser().resolve()
-            if not p.exists(): return ToolResult(False,"","edit_file",path,f"Not found: {p}")
-            with open(p,"r",encoding="utf-8") as f: c = f.read()
-            cnt = c.count(old)
-            if cnt == 0:
-                # #19: Indentation-agnostic fallback
-                stripped = old.strip()
-                for i, line in enumerate(c.splitlines()):
-                    if stripped in line.strip():
-                        return ToolResult(False,"","edit_file",path,
-                            f"Exact not found. Fuzzy match line {i+1}: '{line.strip()[:60]}'")
-                return ToolResult(False,"","edit_file",path,"Not found")
-            if cnt > 1: return ToolResult(False,"","edit_file",path,f"Appears {cnt}x — add context")
-            c = c.replace(old, new, 1)
-            with open(p,"w",encoding="utf-8") as f: f.write(c)
-            with open(p,"r",encoding="utf-8") as f:
-                if new not in f.read(): return ToolResult(False,"","edit_file",path,"Verify failed")
-            return ToolResult(True,f"✓ Replaced in {p}","edit_file",path)
-        except Exception as e: return ToolResult(False,"","edit_file",path,str(e))
-
-    @staticmethod
-    def edit_file_diff(path, search, replace):
-        try:
-            p = Path(path).expanduser().resolve()
-            if not p.exists(): return ToolResult(False,"","edit_file",path,f"Not found: {p}")
-            with open(p,"r",encoding="utf-8") as f: c = f.read()
-            if search not in c:
-                # #19: Whitespace-agnostic
-                ss = search.strip(); lines = c.splitlines()
-                for i, line in enumerate(lines):
-                    if ss in line.strip():
-                        indent = len(line)-len(line.lstrip())
-                        lines[i] = " "*indent + replace.strip() + "\n"
-                        with open(p,"w",encoding="utf-8") as f: f.write("\n".join(lines))
-                        return ToolResult(True,f"✓ Fuzzy replaced line {i+1}","edit_file",path)
-                return ToolResult(False,"","edit_file",path,"SEARCH not found")
-            if c.count(search) > 1: return ToolResult(False,"","edit_file",path,f"Appears {c.count(search)}x")
-            c = c.replace(search, replace, 1)
-            with open(p,"w",encoding="utf-8") as f: f.write(c)
-            return ToolResult(True,f"✓ Replaced block in {p}","edit_file",path)
-        except Exception as e: return ToolResult(False,"","edit_file",path,str(e))
-
-    @staticmethod
-    def compute_diff(old, new, path=""):
-        return "".join(difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
-            fromfile=f"{path}", tofile=f"{path}"))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SHELL TOOL (#25 hardened sandbox, #27 test parsing)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ShellTool:
-    def __init__(self, console): self.console = console; self._sb = shutil.which("sandbox-exec") is not None
+    def user_name(self): return self.data.get('user_name', DEFAULT_USER)
     @property
-    def sandbox_available(self): return self._sb
-    @staticmethod
-    def _profile(cwd, net=False):
-        h=str(Path.home()); t=tempfile.gettempdir(); nr="(allow network*)" if net else "(deny network*)"
-        return f'(version 1)\n(deny default)\n(allow file-read* file-write* (subpath "{cwd}"))\n(allow file-read* file-write* (subpath "{t}"))\n(allow file-read* (subpath "{h}"))\n(allow file-read* (subpath "/usr"))\n(allow file-read* (subpath "/Library"))\n(allow file-read* (subpath "/System"))\n(allow file-read* (subpath "/opt"))\n(allow process-exec (subpath "/usr/bin"))\n(allow process-exec (subpath "/usr/local/bin"))\n(allow process-exec (subpath "{h}/.local/bin"))\n(allow process-exec (subpath "/opt/homebrew"))\n(deny process-exec (literal "/usr/bin/sudo"))\n(deny process-exec (literal "/usr/sbin/mkfs"))\n{nr}\n'
-    def execute_command(self, cmd, cwd, timeout=120, net=False):
+    def model(self): return self.data.get('model', DEFAULT_MODEL)
+    @property
+    def trust_level(self): return self.data.get('trust_level', 'default')
+    @property
+    def thinking_mode(self): return self.data.get('thinking_mode', 'auto')
+    @property
+    def layout_mode(self): return self.data.get('layout_mode', 'stream')
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 4: DATABASE / STATE LAYER
+# ──────────────────────────────────────────────────────────────
+
+class PincerDB:
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT DEFAULT '',
+        created_at REAL,
+        updated_at REAL
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT,
+        role TEXT NOT NULL,
+        content TEXT DEFAULT '',
+        thinking TEXT DEFAULT '',
+        tool_calls TEXT DEFAULT '',
+        tool_name TEXT DEFAULT '',
+        token_count INTEGER DEFAULT 0,
+        created_at REAL,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+    );
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tokens TEXT DEFAULT '',
+        created_at REAL
+    );
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT,
+        step_number INTEGER DEFAULT 0,
+        description TEXT DEFAULT '',
+        state_json TEXT DEFAULT '{}',
+        created_at REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_msgs_conv ON messages(conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_notes_cat ON notes(category);
+    """
+
+    def __init__(self):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.executescript(self.SCHEMA)
+        self.conn.commit()
+
+    def create_conversation(self, title=""):
+        conv_id = str(uuid.uuid4())[:8]
+        now = time.time()
+        self.conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?,?,?,?)",
+            (conv_id, title, now, now)
+        )
+        self.conn.commit()
+        return conv_id
+
+    def list_conversations(self):
+        cur = self.conn.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 20"
+        )
+        return cur.fetchall()
+
+    def update_conversation(self, conv_id, title=None):
+        now = time.time()
+        if title:
+            self.conn.execute("UPDATE conversations SET title=?, updated_at=? WHERE id=?", (title, now, conv_id))
+        else:
+            self.conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
+        self.conn.commit()
+
+    def delete_conversation(self, conv_id):
+        self.conn.execute("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
+        self.conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
+        self.conn.commit()
+
+    def add_message(self, conv_id, role, content="", thinking="", tool_calls="", tool_name="", token_count=0):
+        now = time.time()
+        self.conn.execute(
+            "INSERT INTO messages (conversation_id,role,content,thinking,tool_calls,tool_name,token_count,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (conv_id, role, content, thinking, tool_calls, tool_name, token_count, now)
+        )
+        self.conn.commit()
+
+    def get_messages(self, conv_id, limit=200):
+        cur = self.conn.execute(
+            "SELECT role,content,thinking,tool_calls,tool_name FROM messages WHERE conversation_id=? ORDER BY id ASC LIMIT ?",
+            (conv_id, limit)
+        )
+        return cur.fetchall()
+
+    def get_messages_after_id(self, conv_id, after_id=0, limit=200):
+        cur = self.conn.execute(
+            "SELECT role,content,thinking,tool_calls,tool_name,id FROM messages WHERE conversation_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (conv_id, after_id, limit)
+        )
+        return cur.fetchall()
+
+    def count_messages(self, conv_id):
+        cur = self.conn.execute("SELECT COUNT(*) FROM messages WHERE conversation_id=?", (conv_id,))
+        return cur.fetchone()[0]
+
+    def get_last_message_id(self, conv_id):
+        cur = self.conn.execute("SELECT MAX(id) FROM messages WHERE conversation_id=?", (conv_id,))
+        return cur.fetchone()[0] or 0
+
+    def add_note(self, category, content):
+        now = time.time()
+        tokens = ' '.join(re.findall(r'\b\w+\b', content.lower()))
+        self.conn.execute(
+            "INSERT INTO notes (category, content, tokens, created_at) VALUES (?,?,?,?)",
+            (category, content, tokens, now)
+        )
+        self.conn.commit()
+
+    def get_notes(self, category=None, limit=20):
+        if category:
+            cur = self.conn.execute(
+                "SELECT category, content, created_at FROM notes WHERE category=? ORDER BY created_at DESC LIMIT ?",
+                (category, limit)
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT category, content, created_at FROM notes ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            )
+        return cur.fetchall()
+
+    def search_notes(self, query, limit=5):
+        query_tokens = set(re.findall(r'\b\w+\b', query.lower()))
+        if not query_tokens:
+            return []
+        all_notes = self.conn.execute(
+            "SELECT id, category, content, tokens FROM notes ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+        scored = []
+        for nid, cat, content, tokens_str in all_notes:
+            note_tokens = set(tokens_str.split())
+            overlap = len(query_tokens & note_tokens)
+            if overlap > 0:
+                scored.append((overlap, cat, content))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [(cat, content) for _, cat, content in scored[:limit]]
+
+    def save_checkpoint(self, conv_id, step_number, description, state):
+        now = time.time()
+        self.conn.execute(
+            "INSERT INTO checkpoints (conversation_id,step_number,description,state_json,created_at) VALUES (?,?,?,?,?)",
+            (conv_id, step_number, description, json.dumps(state), now)
+        )
+        self.conn.commit()
+
+    def get_latest_checkpoint(self, conv_id):
+        cur = self.conn.execute(
+            "SELECT step_number, description, state_json, created_at FROM checkpoints WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
+            (conv_id,)
+        )
+        row = cur.fetchone()
+        return row
+
+    def get_checkpoints(self, conv_id):
+        cur = self.conn.execute(
+            "SELECT step_number, description, state_json, created_at FROM checkpoints WHERE conversation_id=? ORDER BY step_number DESC",
+            (conv_id,)
+        )
+        return cur.fetchall()
+
+    def close(self):
+        self.conn.close()
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 5: MEMORY SYSTEM
+# ──────────────────────────────────────────────────────────────
+
+class MemorySystem:
+    def __init__(self, db: PincerDB, config: PincerConfig):
+        self.db = db
+        self.config = config
+        self.working = {
+            'current_plan': None,
+            'current_step': 0,
+            'open_files': [],
+            'recent_edits': [],
+            'pending_approvals': [],
+        }
+        self._ensure_pincer_md()
+
+    def _ensure_pincer_md(self):
+        if not PINCER_MD.exists():
+            content = f"""# PINCER.md — Project & User Notes
+# Auto-managed by Pincer v{VERSION}
+
+## User Preferences
+- Name: {self.config.user_name}
+- Language: {self.config.get('language', 'python')}
+
+## Project Conventions
+(learned automatically)
+
+## Learned Facts
+(learned automatically)
+"""
+            PINCER_MD.write_text(content)
+
+    def read_pincer_md(self):
+        return PINCER_MD.read_text() if PINCER_MD.exists() else ""
+
+    def write_pincer_md(self, content: str):
+        PINCER_MD.write_text(content)
+
+    def add_note(self, category: str, content: str):
+        self.db.add_note(category, content)
+        md = self.read_pincer_md()
+        section_map = {
+            'preference': '## User Preferences',
+            'convention': '## Project Conventions',
+            'fact': '## Learned Facts',
+            'error': '## Learned Facts',
+            'success': '## Learned Facts',
+            'pattern': '## Project Conventions',
+            'observation': '## Learned Facts',
+        }
+        section = section_map.get(category, '## Learned Facts')
+        if section in md:
+            md = md.replace(section, f"{section}\n- {content}")
+            self.write_pincer_md(md)
+
+    def get_notes_for_context(self, limit=5):
+        notes = self.db.get_notes(limit=limit)
+        if not notes:
+            return ""
+        return "\n".join(f"- [{cat}] {content}" for cat, content, _ in notes)
+
+    def get_relevant_notes(self, query: str, limit=3):
+        results = self.db.search_notes(query, limit=limit)
+        if not results:
+            return self.get_notes_for_context(limit)
+        return "\n".join(f"- [{cat}] {content}" for cat, content in results)
+
+    def get_procedural_memory(self):
+        return self.read_pincer_md()[:1500]
+
+    def set_working(self, key, value):
+        self.working[key] = value
+
+    def get_working(self, key, default=None):
+        return self.working.get(key, default)
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 6: OLLAMA BACKEND
+# ──────────────────────────────────────────────────────────────
+
+class OllamaBackend:
+    def __init__(self, config: PincerConfig):
+        self.config = config
+        self.model = config.model
+        self.client = ollama.Client(host='http://localhost:11434')
+        self._ensure_model()
+
+    def _ensure_model(self):
         try:
-            if self._sb:
-                with tempfile.NamedTemporaryFile(mode="w",suffix=".sb",delete=False) as f: f.write(self._profile(cwd,net)); pp=f.name
-                try: r=subprocess.run(["sandbox-exec","-f",pp,"bash","-c",cmd],capture_output=True,text=True,cwd=cwd,timeout=timeout)
-                finally:
-                    try: os.unlink(pp)
-                    except: pass
-            else: r=subprocess.run(["bash","-c",cmd],capture_output=True,text=True,cwd=cwd,timeout=timeout)
-            out=r.stdout
-            if r.stderr: out+=("\n--- stderr ---\n"+r.stderr) if out else r.stderr
-            if r.returncode!=0: return ToolResult(False,out.strip(),"execute_command",cmd,f"Exit {r.returncode}")
-            return ToolResult(True,out.strip(),"execute_command",cmd)
-        except subprocess.TimeoutExpired: return ToolResult(False,"","execute_command",cmd,f"Timeout {timeout}s")
-        except Exception as e: return ToolResult(False,"","execute_command",cmd,str(e))
-    @staticmethod
-    def parse_tests(output):
-        r={"passed":0,"failed":0,"errors":0}
-        m=re.search(r"(\d+) passed",output)
-        if m: r["passed"]=int(m.group(1))
-        m=re.search(r"(\d+) failed",output)
-        if m: r["failed"]=int(m.group(1))
-        m=re.search(r"(\d+) error",output)
-        if m: r["errors"]=int(m.group(1))
-        return r
+            models = self.client.list()
+            model_names = []
+            for m in models.get('models', []):
+                name = m.get('name', '') or getattr(m, 'model', '')
+                model_names.append(name)
+            if not any(self.model in name for name in model_names):
+                print(f"{ANSI['cyan']}{MASCOT} Pulling model {self.model}...{ANSI['reset']}")
+                self.client.pull(self.model)
+        except Exception as e:
+            print(f"{ANSI['red']}{MASCOT} Cannot connect to Ollama: {e}{ANSI['reset']}")
+            print(f"{ANSI['amber']}  Make sure Ollama is running: ollama serve{ANSI['reset']}")
+            sys.exit(1)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TOOL ROUTER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ToolRouter:
-    @dataclass
-    class C: intent:str; params:Dict[str,str]=field(default_factory=dict)
-    def classify(self, text):
-        lo=text.lower(); ws=set(re.findall(r"\w+",lo))
-        rh=len(ws&FILE_READ_KW); wh=sum(1 for k in FILE_WRITE_KW if k in lo)
-        eh=len(ws&FILE_EDIT_KW); sh=len(ws&SHELL_KW)
-        hp=self._p(text) is not None; hc=self._c(text) is not None
-        if sh>0 and hc: return self.C("shell",{"command":self._c(text) or ""})
-        if eh>0 and hp: return self.C("file_edit",{"path":self._p(text) or ""})
-        if wh>0 and hp: return self.C("file_write",{"path":self._p(text) or "","description":self._wd(text,self._p(text) or "")})
-        if rh>0 and hp: return self.C("file_read",{"path":self._p(text) or ""})
-        if sh>0:
-            c=self._c(text) or ""
-            if c: return self.C("shell",{"command":c})
-        return self.C("chat")
-    @staticmethod
-    def _p(t):
-        m=re.search(r'["\']([^"\']+)["\']',t)
-        if m: return m.group(1).strip()
-        for w in re.findall(r"[\w./\-]+",t):
-            if Path(w).suffix.lower() in FILE_EXT: return w
-        m=re.search(r"(?:file|in|to|at)\s+([^\s,;.!?]+)",t,re.I)
-        if m:
-            c=m.group(1).strip("\"'")
-            if c and c.lower() not in {"a","the","this","that","it"}: return c
-        return None
-    @staticmethod
-    def _c(t):
-        lo=t.lower()
-        for kw in ("run","execute"):
-            m=re.search(rf"\b{kw}\s+(.+)",lo)
-            if m: return m.group(1).strip()
-        if re.search(r"\brun\s+tests?\b",lo): return "pytest"
-        for cp in ("git","ls","mkdir","pip","npm","cargo","make","pytest","python","python3","node","docker","brew","curl","wget","rg","grep"):
-            m=re.search(rf"\b({cp}\s+.+)",lo)
-            if m: return m.group(1).strip()
-            if re.search(rf"\b{cp}\b",lo): return cp
-        m=re.search(r"\b(?:delete|remove)\s+(.+)",lo)
-        if m: return "rm -rf ." if m.group(1).strip() in ("everything","all","*") else f"rm -rf {m.group(1).strip()}"
-        if re.search(r"\bbuild\b",lo): return "make"
-        m=re.search(r"\binstall\s+(.+)",lo)
-        if m: return f"pip install {m.group(1).strip()}"
-        return None
-    @staticmethod
-    def _wd(t,p):
-        d=t
-        for rx in (r"^write\s+",r"^create\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?",r"^save\s+",r"^add\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?"): d=re.sub(rx,"",d,flags=re.I).strip()
-        if p: d=d.replace(p,"").strip()
-        d=re.sub(r"\s+(to|in|at)\s*$","",d,flags=re.I).strip()
-        return re.sub(r"\s+"," ",d).strip(" ,.:;!") or f"content for {p}"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FILE WATCHER (#39 of 50)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class FileWatcher:
-    """Polls for file changes and notifies the agent."""
-    def __init__(self): self._mtimes={}; self._running=False; self._changes=[]
-    def start(self):
-        if self._running: return
-        self._running=True; self._scan()
-        t=threading.Thread(target=self._loop, daemon=True); t.start()
-    def stop(self): self._running=False
-    def _scan(self):
-        for root, dirs, files in os.walk("."):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-            for f in files:
-                fp=os.path.join(root,f)
-                try: self._mtimes[fp]=os.path.getmtime(fp)
-                except: pass
-    def _loop(self):
-        while self._running:
-            time.sleep(FILE_WATCH_INTERVAL)
-            for root, dirs, files in os.walk("."):
-                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                for f in files:
-                    fp=os.path.join(root,f)
-                    try:
-                        mt=os.path.getmtime(fp)
-                        if fp in self._mtimes and mt>self._mtimes[fp]:
-                            self._changes.append((fp, "modified"))
-                        self._mtimes[fp]=mt
-                    except: pass
-    def drain(self):
-        ch=self._changes[:]; self._changes.clear(); return ch
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  AUTONOMOUS LOOP (#27 self-healing, #29 architect, #42 pair mode)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class AutonomousLoop:
-    def __init__(self, app):
-        self.app=app; self.task_id=None; self.plan=[]; self.current_step=0
-        self.status="idle"; self.auto_approve=False; self.session_allowed=[]
-        self.start_time=None; self.shell_count=0; self.rm_count=0; self.write_count=0
-        self.llm_calls=0; self.consec_fail=0; self.last_error=""; self.error_repeat=0
-        self.last_heartbeat=0.0; self.last_progress=0.0
-        self.architect_mode=False  # #29
-        self.pair_mode=False       # #42
-
-    def create_task(self, goal):
-        c=self.app.conn.execute("INSERT INTO tasks (goal,status) VALUES (?,'planning')",(goal,))
-        self.task_id=c.lastrowid; self.app.conn.commit()
-        self.start_time=time.time(); self.last_heartbeat=time.time(); self.last_progress=time.time()
-        self.shell_count=0; self.rm_count=0; self.write_count=0; self.llm_calls=0
-        return self.task_id
-
-    def _update(self):
-        if not self.task_id: return
-        el=int((time.time()-self.start_time)/60) if self.start_time else 0
+    def health_check(self):
         try:
-            self.app.conn.execute("UPDATE tasks SET plan=?,current_step=?,total_steps=?,status=?,auto_approve=?,llm_calls=?,shell_count=?,write_count=?,rm_count=?,elapsed_minutes=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (json.dumps(self.plan),self.current_step,len(self.plan),self.status,self.auto_approve,self.llm_calls,self.shell_count,self.write_count,self.rm_count,el,self.task_id))
-        except: self.app.conn.execute("UPDATE tasks SET plan=?,current_step=?,total_steps=?,status=?,auto_approve=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (json.dumps(self.plan),self.current_step,len(self.plan),self.status,self.auto_approve,self.task_id))
-        self.app.conn.commit()
+            self.client.list()
+            return True
+        except Exception:
+            return False
 
-    def load_task(self, tid):
-        r=self.app.conn.execute("SELECT goal,plan,current_step,total_steps,status,auto_approve FROM tasks WHERE id=?",(tid,)).fetchone()
-        if not r: return False
-        self.task_id=tid; self.plan=json.loads(r[1]) if r[1] else []; self.current_step=r[2]
-        self.status=r[4]; self.auto_approve=bool(r[5])
-        self.start_time=time.time(); self.last_heartbeat=time.time(); self.last_progress=time.time()
+    def list_models(self):
+        try:
+            models = self.client.list()
+            return [m.get('name', '') or getattr(m, 'model', '') for m in models.get('models', [])]
+        except Exception:
+            return []
+
+    def chat(self, messages, tools=None, stream=False, think=False):
+        kwargs = {
+            'model': self.model,
+            'messages': messages,
+            'stream': stream,
+        }
+        if tools:
+            kwargs['tools'] = tools
+        # Wire thinking mode to Ollama API — BUG FIX #6
+        if think and self.config.thinking_mode != 'off':
+            try:
+                kwargs['think'] = True
+            except Exception:
+                pass
+        try:
+            return self.client.chat(**kwargs)
+        except TypeError:
+            # Older SDK might not support 'think' parameter
+            kwargs.pop('think', None)
+            return self.client.chat(**kwargs)
+        except ollama.ResponseError as e:
+            raise RuntimeError(f"Ollama error: {e.error}") from e
+        except Exception as e:
+            raise RuntimeError(f"Connection error: {e}") from e
+
+    def stream_chat(self, messages, tools=None, think=False):
+        kwargs = {
+            'model': self.model,
+            'messages': messages,
+            'stream': True,
+        }
+        if tools:
+            kwargs['tools'] = tools
+        # Wire thinking mode — BUG FIX #6
+        if think and self.config.thinking_mode != 'off':
+            try:
+                kwargs['think'] = True
+            except Exception:
+                pass
+        try:
+            return self.client.chat(**kwargs)
+        except TypeError:
+            kwargs.pop('think', None)
+            return self.client.chat(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Stream error: {e}") from e
+
+    def count_tokens_approx(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def set_model(self, model: str):
+        self.model = model
+        self.config.set('model', model)
+        self._ensure_model()
+
+    def should_think(self) -> bool:
+        """Determine if thinking mode should be active for this call."""
+        mode = self.config.thinking_mode
+        if mode == 'on':
+            return True
+        if mode == 'off':
+            return False
+        # 'auto' — let the model decide (pass think=True so API enables it)
         return True
 
-    def generate_plan(self, goal, clar=""):
-        pr=f"Create step-by-step plan for:\n{goal}\n"+(f"Context:\n{clar}\n" if clar else "")+"Output ONLY numbered list, one step per line."
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 7: TOOL DEFINITIONS
+# ──────────────────────────────────────────────────────────────
+
+TOOL_SCHEMAS = [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_file',
+            'description': 'Read the contents of a file. Returns content with line numbers. Supports offset and limit for large files.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Path to the file to read'},
+                    'offset': {'type': 'integer', 'description': 'Starting line number (1-based, default 1)'},
+                    'limit': {'type': 'integer', 'description': 'Maximum number of lines to read (default 200)'},
+                },
+                'required': ['path'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'write_file',
+            'description': 'Create or overwrite a file with the given content. Creates parent directories if needed.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Path to the file to write'},
+                    'content': {'type': 'string', 'description': 'Content to write to the file'},
+                },
+                'required': ['path', 'content'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'edit_file',
+            'description': 'Edit a file by replacing an exact string match. The old_string must be unique in the file. Returns a diff of changes.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Path to the file to edit'},
+                    'old_string': {'type': 'string', 'description': 'Exact string to find and replace (must be unique)'},
+                    'new_string': {'type': 'string', 'description': 'String to replace the old_string with'},
+                },
+                'required': ['path', 'old_string', 'new_string'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'search_files',
+            'description': 'Search for files by name pattern or content. Supports glob patterns for filenames and regex for content.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'pattern': {'type': 'string', 'description': 'File name pattern (glob) or content search pattern'},
+                    'search_type': {'type': 'string', 'enum': ['filename', 'content'], 'description': 'Search by filename or content (default: filename)'},
+                    'path': {'type': 'string', 'description': 'Directory to search in (default: current directory)'},
+                },
+                'required': ['pattern'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'list_directory',
+            'description': 'List the contents of a directory. Shows files and subdirectories with types.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Directory path to list (default: current directory)'},
+                    'recursive': {'type': 'boolean', 'description': 'List recursively (default: false)'},
+                },
+                'required': [],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'execute_command',
+            'description': 'Execute a shell command. Runs in the current working directory with a timeout. Use for running tests, installing packages, git operations, etc.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'command': {'type': 'string', 'description': 'Shell command to execute'},
+                    'timeout': {'type': 'integer', 'description': 'Timeout in seconds (default: 120)'},
+                },
+                'required': ['command'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'web_search',
+            'description': 'Search the web using DuckDuckGo. Returns a list of search results with titles, URLs, and descriptions.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {'type': 'string', 'description': 'Search query'},
+                    'num_results': {'type': 'integer', 'description': 'Number of results to return (default: 5)'},
+                },
+                'required': ['query'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'fetch_url',
+            'description': 'Fetch a web page and convert it to readable text. Good for documentation, articles, and static pages.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'url': {'type': 'string', 'description': 'URL to fetch'},
+                    'max_length': {'type': 'integer', 'description': 'Maximum text length to return (default: 5000)'},
+                },
+                'required': ['url'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'scrape_page',
+            'description': 'Scrape a JavaScript-heavy web page using a headless browser. Use this when fetch_url returns incomplete content. Requires Playwright.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'url': {'type': 'string', 'description': 'URL to scrape'},
+                    'wait_for': {'type': 'string', 'description': 'CSS selector to wait for before extracting content'},
+                    'max_length': {'type': 'integer', 'description': 'Maximum text length to return (default: 5000)'},
+                },
+                'required': ['url'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'ask_user',
+            'description': 'Ask the user a clarifying question and wait for their response. Use when you need more information to proceed.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'question': {'type': 'string', 'description': 'Question to ask the user'},
+                    'options': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Optional list of suggested answers'},
+                },
+                'required': ['question'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'write_note',
+            'description': 'Write a self-note to remember important information for later. Categories: observation, error, success, preference, pattern, fact.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'category': {'type': 'string', 'description': 'Category of the note', 'enum': ['observation', 'error', 'success', 'preference', 'pattern', 'fact']},
+                    'content': {'type': 'string', 'description': 'The note content to remember'},
+                },
+                'required': ['category', 'content'],
+            },
+        },
+    },
+]
+
+TOOL_NAMES = [t['function']['name'] for t in TOOL_SCHEMAS]
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 8: TOOL IMPLEMENTATIONS
+# ──────────────────────────────────────────────────────────────
+
+class ToolExecutor:
+    def __init__(self, config: PincerConfig, db: PincerDB):
+        self.config = config
+        self.db = db
+        self.cwd = str(Path.cwd())
+        self._last_file_read = ""  # For diff tracking
+
+    def execute(self, name: str, args: dict) -> str:
+        handler = getattr(self, f'_tool_{name}', None)
+        if not handler:
+            return f"Error: Unknown tool '{name}'"
         try:
-            resp=self._llm([{"role":"user","content":pr}]); steps=[]
-            for line in resp.strip().split("\n"):
-                m=re.match(r"^\d+[\.\)]\s*(.+)",line.strip())
-                if m: steps.append({"step":len(steps)+1,"description":m.group(1),"status":"pending"})
-            if not steps: steps=[{"step":1,"description":goal,"status":"pending"}]
-            self.plan=steps; self._update(); return steps
-        except Exception as e: self.app.console.print(f"  ❌ Plan failed: {e}",style="bold red"); return []
-
-    def ask_clarifying(self, goal):
-        if not sys.stdin.isatty(): return ""
-        try:
-            resp=self._llm([{"role":"user","content":f"Goal: {goal}\nAsk 1-3 brief clarifying questions (Q: prefix). NONE if clear."}])
-            if "NONE" in resp.upper(): return ""
-            answers=[]
-            for line in resp.strip().split("\n"):
-                q=re.sub(r"^Q:\s*","",line.strip())
-                if not q: continue
-                a=questionary.text(f"  {q}",default="").ask()
-                if a: answers.append(f"Q: {q} A: {a}")
-            return "\n".join(answers)
-        except: return ""
-
-    def _llm(self, msgs): self.llm_calls+=1; return self.app._run_llm_sync(msgs)
-
-    def run_loop(self):
-        self.status="active"; self._update()
-        self.app.console.print(Panel(f"[bold]🚀 Autonomous execution[/]\nSteps: {len(self.plan)} | Auto: {'🟢' if self.auto_approve else '🔴'} | Mode: {'🏗 Architect' if self.architect_mode else '⚡ Execute'}",border_style=BLUE,title="Autonomous"))
-        with Progress(SpinnerColumn(),TextColumn("[bold blue]{task.description}"),BarColumn(bar_width=30),TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),TimeElapsedColumn(),console=self.app.console,transient=True) as prog:
-            task=prog.add_task("Working…",total=len(self.plan))
-            while self.status=="active":
-                g=self._guard()
-                if g: self.status="paused"; self._update(); self.app.console.print(f"\n  ⏸️ {g}",style="bold yellow"); return
-                if time.time()-self.last_heartbeat>HEARTBEAT_INTERVAL:
-                    el=int((time.time()-self.start_time)/60) if self.start_time else 0
-                    d=self.plan[self.current_step]['description'][:50] if self.current_step<len(self.plan) else "done"
-                    self.app.console.print(f"  ⏱️ Step {self.current_step+1}/{len(self.plan)}: {d}… | {el}m",style="dim"); self.last_heartbeat=time.time()
-                if self.current_step>=len(self.plan): prog.update(task,completed=len(self.plan)); self._complete(); return
-                step=self.plan[self.current_step]
-                prog.update(task,completed=self.current_step,description=f"Step {self.current_step+1}: {step['description'][:35]}")
-                self.app.console.print(f"\n  📋 Step {self.current_step+1}/{len(self.plan)}: {step['description']}",style="bold blue")
-                if self.architect_mode:
-                    self.app.console.print("  🏗 Architect mode — planning only, no code changes.",style="dim blue")
-                    self.app.write_note("observation",f"Architect: planned step {step['description']}")
-                    step["status"]="done"; self.current_step+=1; self.last_progress=time.time(); self._update(); continue
-                result=self._exec(step)
-                if result and result.success:
-                    step["status"]="done"; self.current_step+=1; self.consec_fail=0; self.last_progress=time.time()
-                    self.app.write_note("success",f"✓ {step['description']}: {result.output[:200]}")
-                    self.app._auto_commit(f"step {self.current_step}: {step['description'][:60]}")
-                    if self.current_step%5==0: self.save_cp()
-                    self.app.console.print("  ✓ Done",style="green")
-                elif result:
-                    self.consec_fail+=1; step["status"]="failed"
-                    self.app.write_note("error",f"✗ {step['description']}: {result.error[:200]}")
-                    if result.error==self.last_error: self.error_repeat+=1
-                    else: self.error_repeat=1; self.last_error=result.error
-                    if self.error_repeat>=3: self.status="stuck"; self._update(); self.app.console.print("\n  🔄 Loop: same error 3x.",style="bold red"); return
-                    if self.consec_fail>=3: self.status="stuck"; self._update(); self.app.console.print("\n  🔄 Stuck: 3 failures.",style="bold red"); return
-                    # #27: Self-healing — retry with different approach
-                    self.app.console.print(f"  ⚠ Retrying… ({result.error[:80]})",style="yellow")
-                    retry=self._retry(step)
-                    if retry and retry.success:
-                        step["status"]="done"; self.current_step+=1; self.consec_fail=0; self.last_progress=time.time()
-                        self.app.write_note("success",f"✓ Retry: {step['description']}")
-                    else: self.app.console.print("  ✗ Retry failed.",style="red")
-                if self.current_step>0 and self.current_step%10==0: self._eval()
-                self._update()
-
-    def _exec(self, step):
-        desc=step["description"]; cls=self.app.router.classify(desc); cwd=os.getcwd()
-        if self.pair_mode:
-            if not questionary.confirm(f"  Execute: {desc}?",default=True).ask(): return ToolResult(False,"","skipped","","User skipped")
-        if cls.intent=="file_read":
-            path=cls.params.get("path","") or self._infer(desc)
-            if not path: return ToolResult(False,"","read_file","","No path")
-            r=self.app.file_tools.read_file(path); self.app.log_tool("read_file",path,r); return r
-        elif cls.intent=="file_write":
-            path=cls.params.get("path","") or self._infer(desc)
-            if not path: return ToolResult(False,"","write_file","","No path")
-            self.write_count+=1
-            c=self.app._gen_content(desc,path)
-            if not c: return ToolResult(False,"","write_file",path,"Empty")
-            r=self.app.file_tools.write_file(path,c); self.app.log_tool("write_file",path,r); return r
-        elif cls.intent=="file_edit":
-            path=cls.params.get("path","") or self._infer(desc)
-            if not path: return ToolResult(False,"","edit_file","","No path")
-            self.write_count+=1
-            rr=self.app.file_tools.read_file(path)
-            if not rr.success: return rr
-            ep=self.app._gen_edit(desc,path,rr.output)
-            if not ep: return ToolResult(False,"","edit_file",path,"No edit")
-            self.app._show_diff(path,ep[0],ep[1])
-            r=self.app.file_tools.edit_file(path,ep[0],ep[1])
-            if not r.success: r=self.app.file_tools.edit_file_diff(path,ep[0],ep[1])
-            self.app.log_tool("edit_file",path,r); return r
-        elif cls.intent=="shell":
-            cmd=cls.params.get("command","")
-            if not cmd: return ToolResult(False,"","execute_command","","No cmd")
-            self.shell_count+=1
-            risk=self.app.permission_manager.check(cmd,cwd)
-            if risk=="deny": return ToolResult(False,"","execute_command",cmd,"Denied")
-            if cmd.strip().startswith("rm"): self.rm_count+=1
-            if risk=="ask" and not self.auto_approve:
-                if cmd not in self.session_allowed:
-                    a=self._ask_approve(cmd)
-                    if a=="deny": return ToolResult(False,"","execute_command",cmd,"Denied")
-                    if a=="task": self.session_allowed.append(cmd)
-            r=self.app.shell_tool.execute_command(cmd,cwd,net=self.app._needs_net(cmd))
-            if "pytest" in cmd and r.success:
-                ts=ShellTool.parse_tests(r.output)
-                if ts["failed"]>0: r=ToolResult(False,r.output,"execute_command",cmd,f"{ts['failed']} tests failed")
-            return r
-        else:
-            resp=self._llm([{"role":"system","content":self.app.get_system_prompt()},{"role":"user","content":f"Step: {desc}\nActions?"}])
-            return ToolResult(True,resp[:500],"llm",desc)
-
-    def _retry(self, step):
-        desc=step["description"]; cls=self.app.router.classify(desc)
-        if cls.intent=="file_edit":
-            path=cls.params.get("path","") or self._infer(desc)
-            if not path: return None
-            rr=self.app.file_tools.read_file(path)
-            if not rr.success: return None
-            ep=self.app._gen_edit(f"RETRY: {desc}",path,rr.output)
-            if not ep: return None
-            r=self.app.file_tools.edit_file_diff(path,ep[0],ep[1])
-            self.app.log_tool("edit_file_diff",path,r); return r
-        return None
-
-    def _infer(self, desc):
-        p=self.app.router._p(desc)
-        if p: return p
-        for m in re.finditer(r'[\w./\-]+\.\w+',desc):
-            if not m.group(0).startswith(("http","www")): return m.group(0)
-        return ""
-
-    def _ask_approve(self, cmd):
-        if not sys.stdin.isatty(): return "deny"
-        self.app.console.print(Panel(f"[bold]Command:[/bold] {cmd}\n[bold]Step:[/bold] {self.current_step+1}/{len(self.plan)}",title="⚡ Approval",border_style="yellow"))
-        c=questionary.select("  Allow?",choices=["Allow once","Allow for this task","Deny"]).ask()
-        if c=="Allow once": return "allow"
-        if c=="Allow for this task": return "task"
-        return "deny"
-
-    def _guard(self):
-        if self.shell_count>=MAX_SHELL_PER_TASK: return f"Max commands ({MAX_SHELL_PER_TASK})"
-        if self.rm_count>=MAX_RM_PER_TASK: return f"Max rm ({MAX_RM_PER_TASK})"
-        if self.write_count>=MAX_WRITES_PER_TASK: return f"Max writes ({MAX_WRITES_PER_TASK})"
-        if self.start_time and time.time()-self.start_time>MAX_TASK_TIME: return "Max time (2h)"
-        if time.time()-self.last_progress>NO_PROGRESS_TIMEOUT: return "No progress (20m)"
-        return None
-
-    def _complete(self):
-        self.status="completed"; el=int((time.time()-self.start_time)/60) if self.start_time else 0
-        self._update()
-        self.app.console.print(Panel(f"✓ {len(self.plan)} steps done\nTime: {el}m | LLM: {self.llm_calls} | Cmds: {self.shell_count}",title="🎉 Complete",border_style="green"))
-        self.save_cp(); self.app.write_note("success",f"Done in {el}m")
-        self.app._notify("Pincer task complete! 🎉")  # #9
-
-    def _eval(self):
-        d=sum(1 for s in self.plan if s["status"]=="done"); f=sum(1 for s in self.plan if s["status"]=="failed")
-        try:
-            r=self._llm([{"role":"user","content":f"{d}/{len(self.plan)} done, {f} failed. Progress? Adjust? Brief."}])
-            self.app.console.print(f"  💭 {r[:200]}",style="dim italic")
-        except: pass
-
-    def save_cp(self):
-        if not self.task_id: return
-        conv=self.app.conn.execute("SELECT role,content FROM conversation ORDER BY id ASC").fetchall()
-        gh=""
-        try:
-            r=subprocess.run(["git","rev-parse","HEAD"],capture_output=True,text=True)
-            if r.returncode==0: gh=r.stdout.strip()
-        except: pass
-        self.app.conn.execute("INSERT INTO checkpoints (task_id,step_index,conversation_snapshot,working_directory,git_commit_hash) VALUES (?,?,?,?,?)",
-            (self.task_id,self.current_step,json.dumps(conv),os.getcwd(),gh)); self.app.conn.commit()
-
-    def pause(self): self.status="paused"; self.save_cp(); self._update(); self.app.console.print("  ⏸️ Paused.",style="yellow")
-    def abort(self):
-        self.status="aborted"; self._update(); el=int((time.time()-self.start_time)/60) if self.start_time else 0
-        d=sum(1 for s in self.plan if s["status"]=="done")
-        self.app.console.print(f"  🛑 {d}/{len(self.plan)} in {el}m.",style="red")
-
-    def display_plan(self):
-        if not self.plan: return
-        t=Table(title="📋 Plan",border_style=BLUE,padding=(0,1))
-        t.add_column("",width=3); t.add_column("#",width=3); t.add_column("Description")
-        for s in self.plan:
-            ic="✅" if s["status"]=="done" else ("❌" if s["status"]=="failed" else "⬜")
-            mk="▸" if s["step"]-1==self.current_step else " "
-            t.add_row(ic,str(s["step"]),f"{mk} {s['description']}")
-        self.app.console.print(t)
-
-    def progress_text(self):
-        if self.status=="idle" or not self.plan: return "idle"
-        return f"step {self.current_step+1}/{len(self.plan)}"
-
-    def cost(self):
-        el=int((time.time()-self.start_time)/60) if self.start_time else 0
-        return f"LLM: {self.llm_calls} | Cmds: {self.shell_count} | Writes: {self.write_count} | {el}m"
-
-    def health(self):
-        if not self.plan: return 1.0
-        d=sum(1 for s in self.plan if s["status"]=="done"); f=sum(1 for s in self.plan if s["status"]=="failed")
-        return max(0,(d-f*2)/len(self.plan))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PINCER APP — Main Application
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class PincerApp:
-    def __init__(self):
-        self.console=Console()
-        self.err=Console(stderr=True,style="bold red")
-        self.conn=None; self.model=DEFAULT_MODEL; self.thinking=False
-        self.user_name=""; self.lang="python"; self.session=None
-        self._gen=False; self._vec=False; self._emb=False
-        self._memory=""; self._loop=None; self._tc=0; self._tct=0.0
-        self._rmap=None; self._dry_run=False  # #36
-        self.watcher=FileWatcher()  # #39
-        self.router=ToolRouter(); self.ft=FileTools(); self.st=ShellTool(self.console)
-        self.pm=PermissionManager(); self.al=AutonomousLoop(self)
-        self._partial_resp=""  # #6: resume after interrupt
-
-    def _get_loop(self):
-        if self._loop is None or self._loop.is_closed(): self._loop=asyncio.new_event_loop()
-        return self._loop
-    def _run_llm_sync(self, msgs):
-        # #42: Scrub PII before sending
-        scrubbed = [dict(role=m["role"], content=scrub_pii(m["content"])) for m in msgs]
-        lp=self._get_loop()
-        try:
-            r=lp.run_until_complete(lp.run_in_executor(None,lambda:ollama.chat(model=self.model,messages=scrubbed,stream=False)))
-            return self._chat_content(r)
-        except RuntimeError:
-            nl=asyncio.new_event_loop()
-            try: r=nl.run_until_complete(nl.run_in_executor(None,lambda:ollama.chat(model=self.model,messages=scrubbed,stream=False))); return self._chat_content(r)
-            finally: nl.close()
-    @staticmethod
-    def _parse_models(r): return [{"model":m.model,"size":m.size} for m in r.models] if hasattr(r,"models") else r.get("models",[])
-    @staticmethod
-    def _ga(o,k,d=None): return o.get(k,d) if isinstance(o,dict) else getattr(o,k,d)
-    
-    @staticmethod
-    def _chunk_c(c):
-        m = getattr(c, "message", None)
-        if hasattr(m, "content"): return m.content or ""
-        if isinstance(c, dict): return c.get("message", {}).get("content", "") or ""
-        return ""
-        
-    @staticmethod
-    def _chat_content(r):
-        m = getattr(r, "message", None)
-        if hasattr(m, "content"): return m.content or ""
-        if isinstance(r, dict): return r.get("message", {}).get("content", "") or ""
-        return ""
-        
-    @staticmethod
-    def _get_emb(r): return r.get("embedding",[]) if isinstance(r,dict) else getattr(r,"embedding",[])
-    @staticmethod
-    def ct(t): return max(1,len(t)//CHARS_PER_TOKEN) if t else 0
-
-    # ── Database ───────────────────────────────────────────────────────────
-
-    def setup_db(self):
-        PINCER_DIR.mkdir(parents=True,exist_ok=True); SESSIONS_DIR.mkdir(parents=True,exist_ok=True)
-        self.conn=sqlite3.connect(str(DB_PATH)); self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS user_info (key TEXT PRIMARY KEY, value TEXT)")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS conversation (id INTEGER PRIMARY KEY AUTOINCREMENT,role TEXT CHECK(role IN ('system','user','assistant','summary')),content TEXT,tokens INTEGER DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS tool_history (id INTEGER PRIMARY KEY AUTOINCREMENT,tool_name TEXT,command TEXT,status TEXT,output TEXT,timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT,goal TEXT,plan TEXT,current_step INTEGER DEFAULT 0,total_steps INTEGER DEFAULT 0,status TEXT DEFAULT 'planning',auto_approve BOOLEAN DEFAULT FALSE,llm_calls INTEGER DEFAULT 0,shell_count INTEGER DEFAULT 0,write_count INTEGER DEFAULT 0,rm_count INTEGER DEFAULT 0,elapsed_minutes INTEGER DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,completed_at TIMESTAMP)")
-        for c,t in [("llm_calls","INTEGER DEFAULT 0"),("shell_count","INTEGER DEFAULT 0"),("write_count","INTEGER DEFAULT 0"),("rm_count","INTEGER DEFAULT 0"),("elapsed_minutes","INTEGER DEFAULT 0")]:
-            try: self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {c} {t}")
-            except: pass
-        self.conn.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER,category TEXT CHECK(category IN ('observation','error','success','preference','pattern')),content TEXT,embedding BLOB,timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS checkpoints (id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER,step_index INTEGER,conversation_snapshot TEXT,working_directory TEXT,git_commit_hash TEXT,timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        # #44: Budget tracking table
-        self.conn.execute("CREATE TABLE IF NOT EXISTS budgets (id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT,metric TEXT,value INTEGER,timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        self.conn.commit()
-        self._setup_vec(); self._load_allowed()
-    def _setup_vec(self):
-        self._vec=False
-        try:
-            import sqlite_vec; self.conn.enable_load_extension(True); sqlite_vec.load(self.conn); self.conn.enable_load_extension(False)
-            self.conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS tool_history_vec USING vec0(id INTEGER PRIMARY KEY,embedding float[{EMBEDDING_DIM}])")
-            self.conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0(id INTEGER PRIMARY KEY,embedding float[{EMBEDDING_DIM}])")
-            self.conn.commit(); self._vec=True
-        except: pass
-        self._emb=self.check_model(EMBEDDING_MODEL)
-    def _load_allowed(self):
-        r=self.gc("allowed_commands")
-        if r:
-            try: self.pm._always=json.loads(r)
-            except: pass
-        self.pm.load_policy(POLICY_FILE)  # #41
-    def _save_allowed(self): self.sc("allowed_commands",json.dumps(self.pm._always))
-    def gc(self,k): r=self.conn.execute("SELECT value FROM user_info WHERE key=?",(k,)).fetchone(); return r[0] if r else None
-    def sc(self,k,v): self.conn.execute("INSERT OR REPLACE INTO user_info (key,value) VALUES (?,?)",(k,v)); self.conn.commit()
-    def load_config(self):
-        self.user_name=self.gc("user_name") or ""; self.lang=self.gc("preferred_language") or "python"
-        self.model=self.gc("model") or DEFAULT_MODEL; self.thinking=self.gc("thinking_mode")=="on"
-
-    # ── Tool history + Notes ───────────────────────────────────────────────
-
-    def log_tool(self,n,c,r):
-        s="denied" if "denied" in r.error.lower() else ("success" if r.success else "failure")
-        o=(r.output if r.success else r.error)[:2000]
-        rid=self.conn.execute("INSERT INTO tool_history (tool_name,command,status,output) VALUES (?,?,?,?)",(n,c[:500],s,o)).lastrowid
-        self.conn.commit()
-        if self._vec and self._emb: self._store_emb("tool_history_vec",rid,f"{n} {c} {o}")
-    def _store_emb(self,tbl,rid,txt):
-        ok={"tool_history_vec","notes_vec"}
-        if tbl not in ok: return
-        try:
-            r=ollama.embeddings(model=EMBEDDING_MODEL,prompt=txt); e=self._get_emb(r)
-            if e and len(e)==EMBEDDING_DIM:
-                import struct; vb=struct.pack(f"{len(e)}f",*e)
-                self.conn.execute(f"INSERT INTO {tbl} (id,embedding) VALUES (?,?)",(rid,vb)); self.conn.commit()
-        except: pass
-    def rel_hist(self,q,lim=3):
-        if not q: return ""
-        if self._vec and self._emb:
-            try:
-                r=ollama.embeddings(model=EMBEDDING_MODEL,prompt=q); e=self._get_emb(r)
-                if e and len(e)==EMBEDDING_DIM:
-                    import struct; vb=struct.pack(f"{len(e)}f",*e)
-                    rows=self.conn.execute("SELECT t.tool_name,t.command,t.status,t.output FROM tool_history t JOIN tool_history_vec v ON t.id=v.id WHERE v.embedding MATCH ? ORDER BY v.distance LIMIT ?",(vb,lim)).fetchall()
-                    if rows: return "\n".join(["[History]"]+[f"  {'✓' if r[2]=='success' else '✗'} {r[0]}: {r[1][:80]} → {r[2]}" for r in rows])
-            except: pass
-        ws=re.findall(r"\w+",q)
-        if not ws: return ""
-        cd=" OR ".join("command LIKE ?" for _ in ws); ps=[f"%{w}%" for w in ws]+[lim]
-        rows=self.conn.execute(f"SELECT tool_name,command,status FROM tool_history WHERE {cd} ORDER BY id DESC LIMIT ?",ps).fetchall()
-        return "\n".join(["[History]"]+[f"  {'✓' if r[2]=='success' else '✗'} {r[0]}: {r[1][:80]} → {r[2]}" for r in rows]) if rows else ""
-    def write_note(self,cat,content):
-        tid=self.al.task_id
-        # #40: Auto-expire check — if success note for same category as recent error, expire the error
-        if cat=="success":
-            self.conn.execute("DELETE FROM notes WHERE category='error' AND task_id=? AND content LIKE ?",(tid,f"%{content[:30]}%"))
-        self.conn.execute("INSERT INTO notes (task_id,category,content) VALUES (?,?,?)",(tid,cat,content[:2000]))
-        nid=self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]; self.conn.commit()
-        if self._vec and self._emb: self._store_emb("notes_vec",nid,content)
-    def rel_notes(self,q,lim=3):
-        if not q: return ""
-        if self._vec and self._emb:
-            try:
-                r=ollama.embeddings(model=EMBEDDING_MODEL,prompt=q); e=self._get_emb(r)
-                if e and len(e)==EMBEDDING_DIM:
-                    import struct; vb=struct.pack(f"{len(e)}f",*e)
-                    rows=self.conn.execute("SELECT n.category,n.content FROM notes n JOIN notes_vec nv ON n.id=nv.id WHERE nv.embedding MATCH ? ORDER BY nv.distance LIMIT ?",(vb,lim)).fetchall()
-                    if rows:
-                        ic={"success":"✅","error":"❌","observation":"👁","preference":"⚙️","pattern":"🔄"}
-                        return "\n".join(["[Notes]"]+[f"  {ic.get(r[0],'📝')} {r[1][:150]}" for r in rows])
-            except: pass
-        rows=self.conn.execute("SELECT category,content FROM notes WHERE content LIKE ? ORDER BY id DESC LIMIT ?",(f"%{q[:50]}%",lim)).fetchall()
-        return "\n".join(["[Notes]"]+[f"  📝 {r[1][:150]}" for r in rows]) if rows else ""
-
-    # ── RepoMap #11 ────────────────────────────────────────────────────────
-
-    def build_rmap(self,depth=3):
-        if self._rmap: return self._rmap
-        syms={}
-        for root,dirs,files in os.walk("."):
-            dirs[:]=[d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-            if root.count(os.sep)>depth: dirs.clear(); continue
-            for f in files:
-                ext=Path(f).suffix
-                if ext not in (".py",".js",".ts") or ext in BINARY_EXT: continue
-                fp=os.path.join(root,f)
-                try:
-                    c=Path(fp).read_text(encoding="utf-8",errors="replace")
-                    if ext==".py": ds=re.findall(r"^(?:class|def|async def)\s+(\w+)",c,re.M)
-                    else: ds=re.findall(r"(?:function|class|const|let|var)\s+(\w+)",c)
-                    if ds: syms[fp]=ds[:20]
-                except: pass
-        self._rmap=syms; return syms
-
-    # ── Ollama ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def check_ollama(): return shutil.which("ollama") is not None
-    @staticmethod
-    def check_server():
-        try: ollama.list(); return True
-        except: return False
-    def check_model(self,n):
-        try:
-            for m in self._parse_models(ollama.list()):
-                nm=m.get("model","")
-                if nm==n or nm.startswith(n.split(":")[0]+":"): return True
-            return False
-        except: return False
-    def pull_model(self,n):
-        self.console.print(f"  Pulling {n}…",style=BLUE)
-        try:
-            for c in ollama.pull(n,stream=True):
-                t=self._ga(c,"total",0); co=self._ga(c,"completed",0)
-                if t and t>0:
-                    p=int(co/t*100); w=20; f=int(w*co/t)
-                    sys.stdout.write(f"\r  [{'█'*f}{'░'*(w-f)}] {p}% "); sys.stdout.flush()
-                elif "success" in self._ga(c,"status",""): break
-            sys.stdout.write(f"\r  ✓ {n} done.          \n"); sys.stdout.flush()
-        except Exception as e: self.err.print(f"\n  ❌ Pull failed: {e}"); sys.exit(1)
-
-    # ── First-run wizard ───────────────────────────────────────────────────
-
-    def wizard(self):
-        self.console.print(Panel(Text.from_markup("[bold blue]⬡ Pincer[/bold blue] — local AI assistant\n\nSetup takes ~2 minutes."),border_style=BLUE,title="Welcome"))
-        if not self.check_ollama(): self.console.print("❌ Ollama not found.\n   brew install ollama\n   https://ollama.com",style="bold red"); sys.exit(1)
-        self.console.print("  ✓ Ollama found",style="green")
-        if not self.check_server(): self.console.print("❌ Start: ollama serve",style="bold red"); sys.exit(1)
-        self.console.print("  ✓ Server running",style="green")
-        if not self.check_model(self.model): self.pull_model(self.model)
-        else: self.console.print(f"  ✓ {self.model}",style="green")
-        if not self.check_model(EMBEDDING_MODEL): self.console.print(f"  ⚠ Pulling {EMBEDDING_MODEL}…",style="yellow"); self.pull_model(EMBEDDING_MODEL)
-        else: self.console.print(f"  ✓ {EMBEDDING_MODEL}",style="green")
-        nm="user"
-        if sys.stdin.isatty(): nm=questionary.text("  Your name?",default="user").ask() or "user"
-        self.user_name=nm.strip() or "user"; self.sc("user_name",self.user_name)
-        lg="python"
-        if sys.stdin.isatty(): lg=questionary.select("  Language?",choices=["python","javascript","typescript","rust","go","java","c","cpp","ruby","other"],default="python").ask() or "python"
-        self.lang=lg; self.sc("preferred_language",lg)
-        if sys.stdin.isatty(): self._proj_setup()
-        self.sc("model",self.model); self.sc("thinking_mode","off")
-        # #41: Create default policy
-        if not POLICY_FILE.exists():
-            POLICY_FILE.write_text(json.dumps({"deny":["^sudo","^mkfs","^dd if="],"allow":[]},indent=2))
-        self.console.print(Panel("✓ All set!\n\n[bold]Try:[/bold] hello, read README, /help",border_style="green",title="Ready"))
-    def _proj_setup(self):
-        if not Path(".git").exists():
-            if questionary.confirm("  Init git?",default=True).ask():
-                try: subprocess.run(["git","init"],capture_output=True,check=True); self.console.print("  ✓ Git init",style="green")
-                except: pass
-        for mf in MEMORY_FILES:
-            if Path(mf).exists(): self._memory=Path(mf).read_text(encoding="utf-8",errors="replace")[:4000]; self.console.print(f"  ✓ {mf}",style="green"); break
-        else: self._scan_memory()
-    def _scan_memory(self):
-        facts=[]
-        for f,l in [("requirements.txt","Python"),("pyproject.toml","Python"),("package.json","Node.js"),("Cargo.toml","Rust"),("go.mod","Go")]:
-            if Path(f).exists(): facts.append(f"{l} ({f})")
-        if not facts: return
-        if questionary.confirm(f"  Detected: {', '.join(facts)}. Create .pincer.md?",default=True).ask():
-            c="# Project\n\n## Auto-detected\n"+"\n".join(f"- {f}" for f in facts)+"\n"
-            Path(".pincer.md").write_text(c); self._memory=c; self.console.print("  ✓ .pincer.md",style="green")
-
-    # ── System prompt ──────────────────────────────────────────────────────
-
-    def sys_prompt(self):
-        p=f"You are Pincer, a helpful coding assistant on the user's Mac.\nUser: {self.user_name} | Lang: {self.lang}\nBe concise. Markdown for code.\nYou have file tools (read/write/edit) and shell execution.\nAnalyse [Tool: …] blocks and respond.\nIf failed, suggest a fix."
-        if self._memory: p+=f"\n\nProject:\n{self._memory[:2000]}"
-        if self.thinking: p+="\nThink step by step."
-        return p
-
-    # ── Context management (cached tokens) ────────────────────────────────
-
-    def _inv_tc(self): self._tct=0.0
-    def total_tokens(self):
-        if time.time()-self._tct<2 and self._tc>0: return self._tc
-        r=self.conn.execute("SELECT COALESCE(SUM(tokens),0) FROM conversation").fetchone()
-        db=r[0] if r else 0; st=self.ct(self.sys_prompt()); self._tc=db+st; self._tct=time.time(); return self._tc
-    def msg_count(self): return (self.conn.execute("SELECT COUNT(*) FROM conversation").fetchone() or [0])[0]
-    def save_msg(self,role,content):
-        self.conn.execute("INSERT INTO conversation (role,content,tokens) VALUES (?,?,?)",(role,content,self.ct(content))); self.conn.commit(); self._inv_tc()
-    def get_msgs(self):
-        rows=self.conn.execute("SELECT role,content FROM conversation ORDER BY id ASC").fetchall()
-        return [{"role":"system","content":self.sys_prompt()}]+[{"role":"system" if r=="summary" else r,"content":c} for r,c in rows]
-    def compact(self,manual=False):
-        rows=self.conn.execute("SELECT id,role,content FROM conversation ORDER BY id ASC").fetchall()
-        if len(rows)<4:
-            if manual: self.console.print("  ⚠ Need ≥ 4 msgs.",style="yellow")
-            return
-        sp=len(rows)//2; old=rows[:sp]; ct="\n\n".join(f"{r[1]}: {r[2]}" for r in old)
-        try:
-            with self.console.status("  [bold blue]Compacting…[/]"): sm=self._run_llm_sync([{"role":"user","content":f"Summarise:\n\n{ct}"}])
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red"); return
-        ids=[r[0] for r in old]; ph=",".join("?" for _ in ids)
-        self.conn.execute(f"DELETE FROM conversation WHERE id IN ({ph})",ids)
-        self.conn.execute("INSERT INTO conversation (role,content,tokens) VALUES (?,?,?)",("summary",sm,self.ct(sm))); self.conn.commit(); self._inv_tc()
-        self.console.print(f"  ✓ {len(old)} → 1 summary",style="green")
-    def auto_compact(self):
-        tt=self.total_tokens()
-        if tt>COMPACT_THRESHOLD: self.console.print(f"  ⚡ {tt/1000:.1f}K — compacting…",style="yellow"); self.compact()
-        tt=self.total_tokens(); i=0
-        while tt>MAX_TOKENS and i<200:
-            i+=1; r=self.conn.execute("SELECT id FROM conversation WHERE role='user' ORDER BY id ASC LIMIT 1").fetchone()
-            if not r:
-                o=self.conn.execute("SELECT id FROM conversation ORDER BY id ASC LIMIT 1").fetchone()
-                if not o: break
-                self.conn.execute("DELETE FROM conversation WHERE id=?",(o[0],))
-            else:
-                self.conn.execute("DELETE FROM conversation WHERE id=?",(r[0],))
-                n=self.conn.execute("SELECT id FROM conversation WHERE id>? AND role='assistant' ORDER BY id ASC LIMIT 1",(r[0],)).fetchone()
-                if n: self.conn.execute("DELETE FROM conversation WHERE id=?",(n[0],))
-            self.conn.commit(); tt=self.total_tokens()
-
-    # ── Thinking tags ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def strip_think(t): return re.sub(r"<think[^>]*>.*?</think\s*>","",t,flags=re.DOTALL).strip()
-    @staticmethod
-    def _ptl(b,t):
-        for i in range(1,min(len(t)+1,len(b)+1)):
-            if b[-i:]==t[:i]: return i
-        return 0
-
-    # ── Streaming (#1 markdown, #2 syntax) ────────────────────────────────
-
-    def stream(self, msgs):
-        full = ""; int_ = False; ts = False; buf = ""
-        try:
-            self._gen = True
-            for ch in ollama.chat(model=self.model, messages=msgs, stream=True):
-                if not self._gen: break
-                if self._ga(ch, "done", False): break
-                tok = self._chunk_c(ch)
-                if not tok: continue
-                full += tok
-                if not self.thinking:
-                    self.console.print(tok, end="")
-                    continue
-                
-                buf += tok
-                ch2 = True
-                while ch2:
-                    ch2 = False
-                    if not int_:
-                        oi = buf.find(THINK_TAG_OPEN)
-                        if oi != -1:
-                            if oi > 0: self.console.print(buf[:oi], end="")
-                            af = buf[oi + len(THINK_TAG_OPEN):]
-                            gt = af.find(">")
-                            if gt != -1:
-                                buf = af[gt + 1:]
-                                int_ = True
-                                if not ts and int_:
-                                    self.console.print("  ● Thinking…", style=BLUE)
-                                    ts = True
-                                ch2 = True
-                            else:
-                                buf = buf[oi:]
-                        else:
-                            pt = self._ptl(buf, THINK_TAG_OPEN)
-                            s = buf[:len(buf)-pt] if pt else buf
-                            if s: self.console.print(s, end="")
-                            buf = buf[len(s):]
-                    else:
-                        ci = buf.find(THINK_TAG_CLOSE)
-                        if ci != -1:
-                            af = buf[ci + len(THINK_TAG_CLOSE):]
-                            gt = af.find(">")
-                            if gt != -1:
-                                buf = af[gt + 1:]
-                                int_ = False
-                                ch2 = True
-                            else:
-                                buf = buf[ci:]
-                        else:
-                            pt = self._ptl(buf, THINK_TAG_CLOSE)
-                            buf = buf[-pt:] if pt else ""
-                if buf and not int_:
-                    self.console.print(buf, end="")
-            self.console.print()
-        except KeyboardInterrupt:
-            self._gen = False
-            self._partial_resp = full
-            self.console.print("\n  ⏹ Stopped. Type /resume to continue.", style="yellow")
+            cleaned = {k: v for k, v in args.items() if v is not None}
+            return handler(**cleaned)
+        except TypeError as e:
+            return f"Error: Invalid arguments for {name}: {e}"
         except Exception as e:
-            self._gen = False
-            self.console.print(f"\n  ❌ {e}", style="bold red")
-        self._gen = False
-        return full
+            return f"Error executing {name}: {e}"
 
-    # ── Status bar ────────────────────────────────────────────────────────
+    # ── File Tools ──
 
-    def _sbar(self):
-        tt=self.total_tokens(); ctx=f"{tt/1000:.1f}K"; th="on" if self.thinking else "off"
-        sb="🔒" if self.st.sandbox_available else "🔓"
-        tk=self.al.progress_text(); el=""
-        if self.al.start_time and self.al.status=="active": el=f" | ⏱{int((time.time()-self.al.start_time)/60)}m"
-        ap=" 🟢" if self.al.auto_approve else ""
-        dry=" 🏗" if self._dry_run else ""
-        return HTML(f"<style bg='ansiblack' fg='ansiwhite'> {self.model} | thinking:{th} | ctx: {ctx}/12K | {sb} | task: {tk}{el}{ap}{dry}</style>")
-
-    # ── Git + Diff ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _auto_commit(msg):
-        if not Path(".git").exists(): return
-        try: subprocess.run(["git","add","-A"],capture_output=True,check=True); subprocess.run(["git","commit","-m",msg],capture_output=True,check=True)
-        except: pass
-    def _show_diff(self,path,old,new):
-        d=FileTools.compute_diff(old,new,path)
-        if not d: return
-        try: self.console.print(Panel(Syntax(d,"diff",theme="monokai",line_numbers=False),title=f"📝 Diff: {path}",border_style="yellow",padding=(0,1)))
-        except: self.console.print(Panel(d[:2000],title=f"📝 Diff: {path}",border_style="yellow"))
-
-    # ── Tool execution ────────────────────────────────────────────────────
-
-    def _gen_content(self,desc,path):
-        pr=f"Generate complete content for '{path}' based on: {desc}\nOutput ONLY file content. No fences."
+    def _tool_read_file(self, path: str, offset: int = 1, limit: int = 200) -> str:
+        filepath = Path(path).expanduser().resolve()
+        if not filepath.exists():
+            return f"Error: File not found: {path}"
+        if filepath.is_dir():
+            return f"Error: Path is a directory, not a file: {path}"
+        if filepath.stat().st_size > self.config.get('max_file_size', 1_000_000):
+            return f"Error: File too large ({filepath.stat().st_size} bytes). Use offset/limit."
         try:
-            with self.console.status("  [bold blue]Generating…[/]"): c=self._run_llm_sync([{"role":"user","content":pr}])
-            c=re.sub(r"^```[\w]*\n","",c); c=re.sub(r"\n```$","",c); return c.strip()+"\n"
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red"); return ""
-    def _gen_edit(self,req,path,content):
-        pr=f"Modify '{path}'.\n\nCurrent:\n{content}\n\nRequest: {req}\n\nEXACT format:\n<<<OLD>>>\nexact lines\n<<<NEW>>>\nreplacement lines"
+            lines = filepath.read_text(errors='replace').splitlines()
+            start = max(0, offset - 1)
+            end = min(len(lines), start + limit)
+            result_lines = [f"{i+1:6d} | {lines[i]}" for i in range(start, end)]
+            header = f"File: {path} ({len(lines)} lines total, showing {start+1}-{end})"
+            content = header + "\n" + "\n".join(result_lines)
+            self._last_file_read = content
+            return content
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    def _tool_write_file(self, path: str, content: str) -> str:
+        filepath = Path(path).expanduser().resolve()
         try:
-            with self.console.status("  [bold blue]Edit…[/]"): t=self._run_llm_sync([{"role":"user","content":pr}])
-            m=re.search(r"<<<OLD>>>\s*\n(.*?)<<<NEW>>>\s*\n(.*)",t,re.DOTALL)
-            if not m: return None
-            return m.group(1).rstrip("\n"),re.sub(r"\n```\s*$","",m.group(2).rstrip("\n"))
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red"); return None
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            existed = filepath.exists()
+            old_content = filepath.read_text() if existed else ""
+            filepath.write_text(content)
+            line_count = content.count('\n') + 1
+            action = "Updated" if existed else "Created"
+            self.db.add_note('observation', f"{'Updated' if existed else 'Created'} {path} ({line_count} lines)")
+            return json.dumps({
+                'action': action,
+                'path': path,
+                'lines': line_count,
+                'diff_available': existed,
+                'old_content_preview': old_content[:200] if existed else "",
+            })
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
+        except Exception as e:
+            return f"Error writing file: {e}"
 
-    def _approve(self,cmd,cwd,risk):
-        if not sys.stdin.isatty(): return "deny"
-        cs={"safe":"green","ask":"yellow","deny":"red"}; ic={"safe":"✅","ask":"⚠️","deny":"🚫"}
-        c=cs.get(risk,"yellow"); i=ic.get(risk,"⚠️"); si=f"\nStep: {self.al.current_step+1}/{len(self.al.plan)}" if self.al.status=="active" else ""
-        self.console.print(Panel(f"[bold]Command:[/bold] {cmd}\n[bold]Dir:[/bold] {cwd}\n[bold]Risk:[/bold] [{c}]{i} {risk.upper()}[/{c}]{si}",title="⚡ Approval",border_style=c))
-        ch=questionary.select("  Choose:",choices=["Allow once","Allow always","Allow for this task","Deny","Edit command"]).ask()
-        if ch=="Allow once": return "allow"
-        if ch=="Allow always": self.pm.add_allowed(cmd); self._save_allowed(); return "allow"
-        if ch=="Allow for this task": self.al.session_allowed.append(cmd); return "allow"
-        if ch=="Edit command":
-            ed=questionary.text("  Edit:",default=cmd).ask()
-            return f"edit:{ed.strip()}" if ed and ed.strip() else "deny"
-        return "deny"
+    def _tool_edit_file(self, path: str, old_string: str, new_string: str) -> str:
+        filepath = Path(path).expanduser().resolve()
+        if not filepath.exists():
+            return f"Error: File not found: {path}"
+        try:
+            content = filepath.read_text()
+        except Exception as e:
+            return f"Error reading file: {e}"
 
-    def _trunc(self,t,mt=MAX_TOOL_TOKENS):
-        ml=mt*CHARS_PER_TOKEN
-        return t[:ml]+f"\n... [{len(t)-ml} cut]" if len(t)>ml else t
+        count = content.count(old_string)
+        if count == 0:
+            # Try fuzzy matching for whitespace differences
+            normalized_old = old_string.strip()
+            normalized_content = content.strip()
+            if normalized_old in normalized_content:
+                return f"Error: String not found exactly. The text exists but with different whitespace. Copy the exact text from the file."
+            return f"Error: String not found in {path}. The exact text must match."
+        if count > 1:
+            return f"Error: String found {count} times in {path}. Provide more context to make it unique."
 
-    def _render_file(self,path,content):
-        """#1: Syntax-highlighted file rendering."""
-        ext=Path(path).suffix.lstrip(".") or "text"
-        raw=re.sub(r'^\s*\d+\s*│\s?','',content,flags=re.MULTILINE)
-        try: self.console.print(Syntax(raw,ext,theme="monokai",line_numbers=True,word_wrap=True))
-        except: self.console.print(content[:3000])
+        old_content = content
+        new_content = content.replace(old_string, new_string, 1)
+        try:
+            filepath.write_text(new_content)
+        except Exception as e:
+            return f"Error writing file: {e}"
 
-    def handle_tool(self,msg,intent,params):
-        self.auto_compact(); self.save_msg("user",msg); h=self.rel_hist(msg); n=self.rel_notes(msg); cwd=os.getcwd()
-        if intent=="file_read":
-            path=params.get("path","")
-            if not path: self.console.print("  ⚠ No path.",style="yellow"); return
-            r=self.ft.read_file(path); self.log_tool("read_file",path,r)
-            if r.success: self._render_file(path,r.display)
-            else: self.console.print(Panel(r.error,title=f"❌ {path}",border_style="red"))
-            self.save_msg("system",f"[Tool: read('{path}')] {'OK' if r.success else 'FAIL'}\n{self._trunc(r.display)}[/Tool]")
-        elif intent=="file_write":
-            path=params.get("path",""); desc=params.get("description","")
-            if not path: self.console.print("  ⚠ No path.",style="yellow"); return
-            c=params.get("content","")
-            if not c: c=self._gen_content(desc,path)
-            if not c: self.save_msg("system",f"[Tool: write('{path}') FAIL] Empty[/Tool]"); return
-            if self._dry_run: self.console.print(f"  🏗 Dry run: would write {path}",style="blue"); return  # #36
-            r=self.ft.write_file(path,c); self.log_tool("write_file",path,r)
-            self.console.print(Panel(r.display,title=f"📝 write: {path}",border_style="green" if r.success else "red"))
-            if r.success: self._auto_commit(f"write: {path}")
-            self.write_note("success" if r.success else "error",f"write {path}: {r.display[:200]}")
-            self.save_msg("system",f"[Tool: write('{path}')] {'OK' if r.success else 'FAIL'}\n{r.display}[/Tool]")
-        elif intent=="file_edit":
-            path=params.get("path","")
-            if not path: self.console.print("  ⚠ No path.",style="yellow"); return
-            os=params.get("old_string",""); ns=params.get("new_string","")
-            if not os or not ns:
-                rr=self.ft.read_file(path)
-                if not rr.success: self.log_tool("edit_file",path,rr); self.console.print(Panel(rr.error,title=f"❌ {path}",border_style="red")); return
-                ep=self._gen_edit(msg,path,rr.output)
-                if not ep: self.save_msg("system",f"[Tool: edit('{path}') FAIL] Parse error[/Tool]"); return
-                os,ns=ep
+        # Generate actual unified diff
+        diff_lines = list(difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"{path} (before)",
+            tofile=f"{path} (after)",
+            lineterm='',
+        ))
+
+        old_lines = old_string.splitlines()
+        new_lines = new_string.splitlines()
+        summary = f"Replaced {len(old_lines)} line(s) with {len(new_lines)} line(s) in {path}"
+        self.db.add_note('observation', f"Edited {path}: {summary}")
+
+        return json.dumps({
+            'summary': summary,
+            'path': path,
+            'old_lines': len(old_lines),
+            'new_lines': len(new_lines),
+            'diff': '\n'.join(diff_lines),
+        })
+
+    def _tool_search_files(self, pattern: str, search_type: str = 'filename', path: str = None) -> str:
+        search_dir = Path(path).expanduser().resolve() if path else Path.cwd()
+        if not search_dir.exists():
+            return f"Error: Directory not found: {path}"
+        results = []
+        try:
+            if search_type == 'filename':
+                for p in search_dir.rglob(pattern):
+                    if len(results) >= 30:
+                        results.append("... (more results)")
+                        break
+                    try:
+                        rel = p.relative_to(search_dir)
+                        results.append(str(rel))
+                    except ValueError:
+                        results.append(str(p))
+            else:
+                try:
+                    regex = re.compile(pattern, re.IGNORECASE)
+                except re.error:
+                    return f"Error: Invalid regex pattern: {pattern}"
+                skip_ext = {'.pyc', '.pyo', '.so', '.dylib', '.png', '.jpg', '.jpeg', '.gif',
+                           '.zip', '.tar', '.gz', '.woff', '.ttf', '.eot', '.ico', '.svg', '.min.js', '.min.css'}
+                for p in search_dir.rglob('*'):
+                    if not p.is_file():
+                        continue
+                    if any(part.startswith('.') for part in p.parts):
+                        continue
+                    if p.suffix in skip_ext:
+                        continue
+                    if p.stat().st_size > 100_000:
+                        continue
+                    if len(results) >= 20:
+                        results.append("... (more results)")
+                        break
+                    try:
+                        text = p.read_text(errors='ignore')
+                        for i, line in enumerate(text.splitlines()[:500], 1):
+                            if regex.search(line):
+                                try:
+                                    rel = p.relative_to(search_dir)
+                                except ValueError:
+                                    rel = p
+                                results.append(f"{rel}:{i}: {line.strip()[:120]}")
+                                if len(results) >= 20:
+                                    break
+                    except Exception:
+                        continue
+        except Exception as e:
+            return f"Error searching: {e}"
+        if not results:
+            return f"No results found for '{pattern}'"
+        return "\n".join(results)
+
+    def _tool_list_directory(self, path: str = None, recursive: bool = False) -> str:
+        dirpath = Path(path).expanduser().resolve() if path else Path.cwd()
+        if not dirpath.exists():
+            return f"Error: Directory not found: {path}"
+        if not dirpath.is_dir():
+            return f"Error: Not a directory: {path}"
+        results = []
+        try:
+            items = sorted(dirpath.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            for p in items:
+                prefix = "📁" if p.is_dir() else "📄"
+                size = ""
+                if p.is_file():
+                    try:
+                        st = p.stat().st_size
+                        size = f" ({st:,}B)" if st < 1024 else f" ({st//1024:,}KB)"
+                    except Exception:
+                        pass
+                results.append(f"{prefix} {p.name}{size}")
+                if recursive and p.is_dir() and not p.name.startswith('.'):
+                    for child in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                        cprefix = "  📁" if child.is_dir() else "  📄"
+                        results.append(f"{cprefix} {child.name}")
+        except PermissionError:
+            return "Error: Permission denied"
+        except Exception as e:
+            return f"Error listing directory: {e}"
+        return "\n".join(results)
+
+    # ── Shell Tool ──
+
+    def _tool_execute_command(self, command: str, timeout: int = None) -> str:
+        timeout = timeout or self.config.get('max_shell_timeout', 120)
+        for pat in DENY_PATTERNS:
+            if re.search(pat, command, re.IGNORECASE):
+                return f"BLOCKED: Command matches dangerous pattern. If you're sure, run it directly in your terminal."
+        try:
+            result = subprocess.run(
+                command, shell=True, cwd=self.cwd,
+                capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, 'TERM': 'dumb'},
+            )
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                output += ("\nSTDERR:\n" + result.stderr) if output else result.stderr
+            if not output:
+                output = f"(no output, exit code: {result.returncode})"
+            max_lines = self.config.get('max_output_lines', 200)
+            lines = output.splitlines()
+            if len(lines) > max_lines:
+                head = "\n".join(lines[:20])
+                tail = "\n".join(lines[-20:])
+                output = f"{head}\n\n... ({len(lines) - 40} lines truncated) ...\n\n{tail}"
+            if result.returncode != 0:
+                output += f"\nExit code: {result.returncode}"
+            return output
+        except subprocess.TimeoutExpired:
+            return f"Error: Command timed out after {timeout}s"
+        except Exception as e:
+            return f"Error executing command: {e}"
+
+    # ── Web Tools ──
+
+    def _tool_web_search(self, query: str, num_results: int = 5) -> str:
+        """Search the web using DuckDuckGo — BUG FIX #1: use urllib.parse.quote"""
+        if not self.config.get('web_search_enabled', True):
+            return "Error: Web search is disabled in config."
+        try:
+            url = f"https://lite.duckduckgo.com/lite/?q={url_quote(query)}"
+            headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+            with httpx.Client(timeout=15, follow_redirects=True) as client:
+                resp = client.get(url, headers=headers)
+                soup = BeautifulSoup(resp.text, 'html.parser')
+
+            results = []
+            # Parse DuckDuckGo Lite results
+            for row in soup.find_all('tr'):
+                link = row.find('a', class_='result-link')
+                if link and len(results) < num_results:
+                    title = link.get_text(strip=True)
+                    href = link.get('href', '')
+                    snippet_tag = row.find('td', class_='result-snippet')
+                    snippet = snippet_tag.get_text(strip=True)[:200] if snippet_tag else ""
+                    if title:
+                        results.append(f"{len(results)+1}. {title}\n   {href}\n   {snippet}" if snippet else f"{len(results)+1}. {title}\n   {href}")
+
+            if not results:
+                # Fallback parser
+                for a in soup.find_all('a'):
+                    href = a.get('href', '')
+                    if href.startswith('http') and 'duckduckgo' not in href and 'duck' not in href:
+                        title = a.get_text(strip=True)
+                        if title and len(title) > 5 and len(results) < num_results:
+                            results.append(f"{len(results)+1}. {title}\n   {href}")
+
+            if not results:
+                return f"No results found for '{query}'"
+            return "\n\n".join(results)
+        except httpx.TimeoutException:
+            return "Error: Search request timed out"
+        except Exception as e:
+            return f"Error searching: {e}"
+
+    def _tool_fetch_url(self, url: str, max_length: int = 5000) -> str:
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
+            with httpx.Client(timeout=20, follow_redirects=True) as client:
+                resp = client.get(url, headers=headers)
+                resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
+                tag.decompose()
+            text = soup.get_text(separator='\n', strip=True)
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            if len(text) > max_length:
+                text = text[:max_length] + f"\n\n... (truncated at {max_length} chars)"
+            title = soup.title.string.strip() if soup.title and soup.title.string else url
+            return f"Title: {title}\nURL: {url}\n\n{text}"
+        except httpx.HTTPStatusError as e:
+            return f"Error: HTTP {e.response.status_code} for {url}"
+        except httpx.TimeoutException:
+            return "Error: Request timed out"
+        except Exception as e:
+            return f"Error fetching URL: {e}"
+
+    def _tool_scrape_page(self, url: str, wait_for: str = '', max_length: int = 5000) -> str:
+        """Scrape JS-heavy pages with Playwright headless browser."""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return ("Error: Playwright not installed.\n"
+                    "Run: pip install playwright && playwright install chromium\n"
+                    "Falling back to fetch_url (may miss JS-rendered content).")
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                if wait_for:
+                    page.wait_for_selector(wait_for, timeout=10000)
+                else:
+                    page.wait_for_timeout(2000)
+                content = page.content()
+                browser.close()
+
+            soup = BeautifulSoup(content, 'html.parser')
+            for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
+                tag.decompose()
+            text = soup.get_text(separator='\n', strip=True)
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            if len(text) > max_length:
+                text = text[:max_length] + f"\n\n... (truncated at {max_length} chars)"
+            title = soup.title.string.strip() if soup.title and soup.title.string else url
+            return f"Title: {title}\nURL: {url}\n(Scraped with Playwright)\n\n{text}"
+        except Exception as e:
+            return f"Error scraping page: {e}"
+
+    # ── System Tools ──
+
+    def _tool_ask_user(self, question: str, options: list = None) -> str:
+        return f"ASK_USER:{json.dumps({'question': question, 'options': options or []})}"
+
+    def _tool_write_note(self, category: str, content: str) -> str:
+        self.db.add_note(category, content)
+        return f"Note saved: [{category}] {content}"
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 9: MCP CLIENT (Basic HTTP)
+# ──────────────────────────────────────────────────────────────
+
+class MCPClient:
+    """Basic MCP client for connecting to MCP servers over HTTP/SSE."""
+
+    def __init__(self):
+        self.servers = {}
+        self.available_tools = {}
+
+    def add_server(self, name: str, url: str, auth: str = None):
+        self.servers[name] = {'url': url.rstrip('/'), 'auth': auth}
+        self._discover_tools(name)
+
+    def _discover_tools(self, server_name: str):
+        server = self.servers.get(server_name)
+        if not server:
+            return
+        try:
+            headers = {}
+            if server['auth']:
+                headers['Authorization'] = f"Bearer {server['auth']}"
+            with httpx.Client(timeout=10) as client:
+                resp = client.post(f"{server['url']}/tools/list", json={}, headers=headers)
+                data = resp.json()
+                tools = data.get('tools', [])
+                for tool in tools:
+                    tool_name = tool.get('name', '')
+                    if tool_name:
+                        self.available_tools[f"{server_name}:{tool_name}"] = {
+                            'server': server_name,
+                            'name': tool_name,
+                            'description': tool.get('description', ''),
+                            'schema': tool.get('inputSchema', {}),
+                        }
+        except Exception:
+            pass
+
+    def call_tool(self, full_name: str, arguments: dict) -> str:
+        tool_info = self.available_tools.get(full_name)
+        if not tool_info:
+            return f"Error: MCP tool '{full_name}' not found"
+        server = self.servers.get(tool_info['server'])
+        if not server:
+            return f"Error: MCP server '{tool_info['server']}' not found"
+        try:
+            headers = {}
+            if server['auth']:
+                headers['Authorization'] = f"Bearer {server['auth']}"
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    f"{server['url']}/tools/call",
+                    json={'name': tool_info['name'], 'arguments': arguments},
+                    headers=headers,
+                )
+                data = resp.json()
+                contents = data.get('content', [])
+                if contents:
+                    return contents[0].get('text', json.dumps(contents))
+                return json.dumps(data)
+        except Exception as e:
+            return f"MCP error: {e}"
+
+    def list_available(self) -> list:
+        return list(self.available_tools.keys())
+
+    def get_tool_schemas(self) -> list:
+        """Convert MCP tools to Ollama tool schema format."""
+        schemas = []
+        for full_name, info in self.available_tools.items():
+            schema = {
+                'type': 'function',
+                'function': {
+                    'name': f"mcp_{full_name.replace(':', '_').replace('-', '_')}",
+                    'description': info['description'] or f"MCP tool: {full_name}",
+                    'parameters': info.get('schema', {'type': 'object', 'properties': {}}),
+                }
+            }
+            schemas.append(schema)
+        return schemas
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 10: PERMISSION SYSTEM
+# ──────────────────────────────────────────────────────────────
+
+class PermissionSystem:
+    def __init__(self, config: PincerConfig, console: Console):
+        self.config = config
+        self.console = console
+        self.session_approvals = set()
+
+    @property
+    def trust_level(self):
+        return self.config.trust_level
+
+    def check(self, tool_name: str, args: dict) -> bool:
+        trust = self.trust_level
+
+        # Always allowed tools
+        if tool_name in ('read_file', 'list_directory', 'search_files'):
+            if trust != 'plan':
+                return True
+        if tool_name in ('write_note', 'ask_user'):
+            return True
+        if tool_name in ('web_search', 'fetch_url', 'scrape_page'):
+            if trust in ('auto', 'dontAsk', 'default', 'acceptEdits'):
+                return True
+
+        # File write/edit
+        if tool_name in ('write_file', 'edit_file'):
+            if trust in ('auto', 'dontAsk', 'acceptEdits'):
+                return True
+            if 'file_edits' in self.session_approvals:
+                return True
+            if trust == 'plan':
+                return self._ask_permission(tool_name, args)
+
+        # Shell commands — most restricted
+        if tool_name == 'execute_command':
+            command = args.get('command', '')
+            for pat in DENY_PATTERNS:
+                if re.search(pat, command, re.IGNORECASE):
+                    self.console.print(
+                        f"\n[{C['error']}]🚨 Blocked dangerous command:[/{C['error']}] "
+                        f"[{C['text_dim']}]{command}[/{C['text_dim']}]"
+                    )
+                    return False
+            for pat in SAFE_PATTERNS:
+                if re.search(pat, command, re.IGNORECASE):
+                    if trust in ('auto', 'dontAsk', 'default', 'acceptEdits'):
+                        return True
+            approval_key = f"cmd:{command.split()[0] if command.split() else command}"
+            if approval_key in self.session_approvals:
+                return True
+            if trust == 'dontAsk':
+                return True
+            return self._ask_permission(tool_name, args)
+
+        if trust == 'plan':
+            return self._ask_permission(tool_name, args)
+        return True
+
+    def _ask_permission(self, tool_name: str, args: dict) -> bool:
+        self.console.print()
+        if tool_name == 'execute_command':
+            cmd = args.get('command', '')
+            panel = Panel(
+                f"[{C['text_bright']}]$ {cmd}[/{C['text_bright']}]",
+                title=f"[{C['warning']}]⚠️  Allow this command?[/{C['warning']}]",
+                border_style=C['warning'], padding=(1, 2),
+            )
+            self.console.print(panel)
+            self.console.print(
+                f"  [{C['text_dim']}]\\[Y]\\[/{C['text_dim']}] Allow once  "
+                f"[{C['text_dim']}]\\[A]\\[/{C['text_dim']}] Allow all '{cmd.split()[0] if cmd.split() else cmd}'  "
+                f"[{C['text_dim']}]\\[N]\\[/{C['text_dim']}] Deny  "
+                f"[{C['text_dim']}]\\[E]\\[/{C['text_dim']}] Edit",
+                highlight=False,
+            )
+        elif tool_name in ('write_file', 'edit_file'):
+            path = args.get('path', '?')
+            action = "edit" if tool_name == 'edit_file' else "write"
+            panel = Panel(
+                f"[{C['text_bright']}]{action}: {path}[/{C['text_bright']}]",
+                title=f"[{C['warning']}]⚠️  Allow file {action}?[/{C['warning']}]",
+                border_style=C['warning'], padding=(1, 2),
+            )
+            self.console.print(panel)
+            self.console.print(
+                f"  [{C['text_dim']}]\\[Y]\\[/{C['text_dim']}] Allow once  "
+                f"[{C['text_dim']}]\\[A]\\[/{C['text_dim']}] Allow all file edits  "
+                f"[{C['text_dim']}]\\[N]\\[/{C['text_dim']}] Deny",
+                highlight=False,
+            )
+        else:
+            panel = Panel(
+                f"[{C['text_bright']}]{tool_name}({json.dumps(args, default=str)[:100]})[/{C['text_bright']}]",
+                title=f"[{C['warning']}]⚠️  Allow this action?[/{C['warning']}]",
+                border_style=C['warning'], padding=(1, 2),
+            )
+            self.console.print(panel)
+            self.console.print(
+                f"  [{C['text_dim']}]\\[Y]\\[/{C['text_dim']}] Allow  "
+                f"[{C['text_dim']}]\\[N]\\[/{C['text_dim']}] Deny",
+                highlight=False,
+            )
+
+        try:
+            choice = input(f"\n{ANSI['amber']}{MASCOT}❓ > {ANSI['reset']}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            self.console.print(f"\n[{C['text_dim']}]Denied.[/{C['text_dim']}]")
+            return False
+
+        if choice in ('y', 'yes', ''):
+            return True
+        elif choice == 'a':
+            if tool_name == 'execute_command':
+                cmd = args.get('command', '')
+                self.session_approvals.add(f"cmd:{cmd.split()[0] if cmd.split() else cmd}")
+            elif tool_name in ('write_file', 'edit_file'):
+                self.session_approvals.add('file_edits')
+            return True
+        elif choice == 'e' and tool_name == 'execute_command':
+            old_cmd = args.get('command', '')
+            self.console.print(f"[{C['text_dim']}]Current: {old_cmd}[/{C['text_dim']}]")
             try:
-                with open(path,"r",encoding="utf-8") as f: cur=f.read()
-                self._show_diff(path,os,ns)
-            except: pass
-            if self._dry_run: self.console.print(f"  🏗 Dry run: would edit {path}",style="blue"); return
-            r=self.ft.edit_file(path,os,ns)
-            if not r.success: r=self.ft.edit_file_diff(path,os,ns)
-            self.log_tool("edit_file",path,r)
-            self.console.print(Panel(r.display,title=f"✏️ edit: {path}",border_style="green" if r.success else "red"))
-            if r.success: self._auto_commit(f"edit: {path}")
-            self.write_note("success" if r.success else "error",f"edit {path}: {r.display[:200]}")
-            self.save_msg("system",f"[Tool: edit('{path}')] {'OK' if r.success else 'FAIL'}\n{r.display}[/Tool]")
-        elif intent=="shell":
-            cmd=params.get("command","")
-            if not cmd: self.console.print("  ⚠ No cmd.",style="yellow"); return
-            risk=self.pm.check(cmd,cwd)
-            if risk=="deny":
-                self.console.print(Panel(f"🚫 {cmd}",border_style="red",title="Blocked"))
-                self.log_tool("execute_command",cmd,ToolResult(False,"","execute_command",cmd,"Denied"))
-                self.write_note("error",f"🚫 {cmd}")
-                self.save_msg("system",f"[Tool: DENIED] {cmd}[/Tool]")
-            elif risk=="ask":
-                a=self._approve(cmd,cwd,"ask")
-                if a=="deny":
-                    self.log_tool("execute_command",cmd,ToolResult(False,"","execute_command",cmd,"Denied"))
-                    self.write_note("error",f"Denied: {cmd}")
-                    self.save_msg("system",f"[Tool: DENIED] {cmd}[/Tool]")
-                elif a.startswith("edit:"):
-                    ec=a[5:]
-                    if self.pm.check(ec,cwd)=="deny": self.save_msg("system",f"[Tool: DENIED] {ec}[/Tool]")
-                    else: r=self.st.execute_command(ec,cwd,net=self._needs_net(ec)); self._shell_result(ec,r)
-                else: r=self.st.execute_command(cmd,cwd,net=self._needs_net(cmd)); self._shell_result(cmd,r)
-            else: r=self.st.execute_command(cmd,cwd,net=self._needs_net(cmd)); self._shell_result(cmd,r)
-        ms=self.get_msgs()
-        if h: ms.insert(1,{"role":"system","content":h})
-        if n: ms.insert(1,{"role":"system","content":n})
-        self.console.print(); resp=self.stream(ms); self.console.print()
-        if resp.strip(): self.save_msg("assistant",resp)
+                new_cmd = input(f"{ANSI['cyan']}Edit: {ANSI['reset']}").strip()
+                if new_cmd:
+                    args['command'] = new_cmd
+                    return True
+            except (EOFError, KeyboardInterrupt):
+                pass
+            return False
 
-    def _shell_result(self,cmd,r):
-        self.log_tool("execute_command",cmd,r)
-        b="green" if r.success else "red"
-        t=f"🔧 {cmd[:50]}" + (f" ({r.error})" if not r.success else "")
-        self.console.print(Panel(r.truncated(),title=t,border_style=b))
-        self.save_msg("system",f"[Tool: cmd('{cmd}')] {'OK' if r.success else 'FAIL'}\n{self._trunc(r.display)}[/Tool]")
-
-    @staticmethod
-    def _needs_net(c):
-        for p in ["pip install","npm install","cargo","git clone","git pull","git push","git fetch","brew","curl","wget"]:
-            if c.strip().startswith(p): return True
+        self.console.print(f"[{C['text_dim']}]Denied.[/{C['text_dim']}]")
         return False
 
-    # ── #9: Desktop notifications ─────────────────────────────────────────
 
-    def _notify(self, msg):
-        if sys.platform=="darwin":
-            try: subprocess.run(["osascript","-e",f'display notification "{msg}" with title "Pincer"'],capture_output=True)
-            except: pass
+# ──────────────────────────────────────────────────────────────
+# SECTION 11: CONTEXT MANAGER (Improved Compaction)
+# ──────────────────────────────────────────────────────────────
 
-    # ── #6: Resume after interrupt ────────────────────────────────────────
+class ContextManager:
+    """Assembles and compacts context — BUG FIX #3: preserve tool pairs."""
 
-    def cmd_resume_interrupt(self):
-        if self._partial_resp:
-            self.console.print("  Continuing from interrupted response…",style=BLUE)
-            msgs=self.get_msgs()
-            msgs.append({"role":"user","content":"Continue from where you left off."})
-            self.console.print(); resp=self.stream(msgs); self.console.print()
-            if resp.strip(): self.save_msg("assistant",self._partial_resp+resp)
-            self._partial_resp=""
-        else: self.console.print("  Nothing to resume.",style="dim")
+    SYSTEM_TEMPLATE = """You are Pincer, an autonomous coding agent running locally via Ollama.
 
-    # ── Checkpoint / Resume ───────────────────────────────────────────────
+## Your Identity
+- You are Pinch 🦞, a helpful, thorough, and careful coding assistant.
+- You are transparent: always show your reasoning before acting.
 
-    def save_cp(self): self.al.save_cp(); self.console.print("  ✓ Checkpoint saved.",style="green")
-    def resume_task(self, tid=None):
-        if tid is None:
-            r=self.conn.execute("SELECT id,goal,status FROM tasks WHERE status IN ('paused','active','stuck') ORDER BY updated_at DESC LIMIT 1").fetchone()
-            if not r: self.console.print("  ⚠ No paused tasks.",style="yellow"); return
-            tid=r[0]; self.console.print(f"  📋 {r[1]} ({r[2]})")
-        if not self.al.load_task(tid): self.console.print(f"  ❌ Not found.",style="bold red"); return
-        cp=self.conn.execute("SELECT conversation_snapshot,working_directory FROM checkpoints WHERE task_id=? ORDER BY id DESC LIMIT 1",(tid,)).fetchone()
-        if cp:
+## Your Capabilities
+- Read, write, and edit files
+- Execute shell commands
+- Search the web for information
+- Fetch and scrape web pages
+- Manage project structure
+- Write and run tests
+- Write self-notes to remember important findings
+
+## Your Rules
+1. ALWAYS use tools to accomplish tasks. Don't just describe what to do — do it.
+2. Before writing code, read relevant files to understand the codebase.
+3. After making changes, verify they work (run tests, check syntax).
+4. Write self-notes (write_note tool) about important findings, user preferences, and patterns.
+5. Ask the user for clarification (ask_user tool) if the request is ambiguous.
+6. Show your thinking before taking action.
+7. Be concise but thorough.
+8. If something fails, diagnose and fix it before asking the user.
+9. Never output harmful or malicious content.
+10. Respect the user's code style and project conventions.
+
+## Current Environment
+- Working directory: {cwd}
+- User: {user_name}
+- Primary language: {language}
+
+## Memory
+{memory}
+
+## User Notes
+{notes}
+"""
+
+    def __init__(self, config: PincerConfig, memory: MemorySystem, backend: OllamaBackend):
+        self.config = config
+        self.memory = memory
+        self.backend = backend
+
+    def build_system_prompt(self) -> str:
+        return self.SYSTEM_TEMPLATE.format(
+            cwd=str(Path.cwd()),
+            user_name=self.config.user_name,
+            language=self.config.get('language', 'python'),
+            memory=self.memory.get_procedural_memory()[:1000],
+            notes=self.memory.get_notes_for_context(5),
+        )
+
+    def assemble_context(self, conversation_messages: list, user_input: str = None) -> list:
+        messages = []
+        system_prompt = self.build_system_prompt()
+        messages.append({'role': 'system', 'content': system_prompt})
+
+        system_tokens = self.backend.count_tokens_approx(system_prompt)
+        tool_tokens = TOOL_SCHEMA_TOKENS
+        budget = MAX_CONTEXT_TOKENS - system_tokens - tool_tokens - MEMORY_TOKENS - 500
+
+        # Add messages from newest to oldest until budget is exhausted
+        history_messages = []
+        used_tokens = 0
+        for msg in reversed(conversation_messages):
+            msg_tokens = self.backend.count_tokens_approx(msg.get('content', ''))
+            if used_tokens + msg_tokens > budget:
+                break
+            history_messages.insert(0, msg)
+            used_tokens += msg_tokens
+
+        messages.extend(history_messages)
+        if user_input:
+            messages.append({'role': 'user', 'content': user_input})
+        return messages
+
+    def compact_context(self, messages: list) -> list:
+        """BUG FIX #3: Never split a tool_calls + tool result pair."""
+        if not messages:
+            return messages
+
+        # Layer 1: Trim long tool outputs (but keep them paired)
+        compacted = []
+        for msg in messages:
+            content = msg.get('content', '')
+            if len(content) > 2000:
+                content = content[:500] + f"\n... (truncated from {len(content)} chars) ...\n" + content[-500:]
+                msg = {**msg, 'content': content}
+            compacted.append(msg)
+
+        # Layer 2: Preserve complete turns (tool_call + tool_result pairs)
+        if len(compacted) > 15:
+            # Group messages into "turns" that must stay together
+            turns = self._group_into_turns(compacted)
+
+            # Always keep the first 2 and last 6 turns
+            if len(turns) > 8:
+                essential_start = turns[:2]
+                essential_end = turns[-6:]
+                middle = turns[2:-6]
+
+                # Summarize middle turns
+                if middle:
+                    middle_text = self._concat_turn_summaries(middle)
+                    summary_msg = {
+                        'role': 'system',
+                        'content': f'[Earlier conversation summary: {middle_text}]'
+                    }
+                    compacted = []
+                    for turn in essential_start:
+                        compacted.extend(turn)
+                    compacted.append(summary_msg)
+                    for turn in essential_end:
+                        compacted.extend(turn)
+
+        return compacted
+
+    def _group_into_turns(self, messages: list) -> list:
+        """Group messages into turns, keeping tool_calls + tool_results together."""
+        turns = []
+        current_turn = []
+
+        for msg in messages:
+            role = msg.get('role', '')
+            has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
+
+            if role == 'system' and current_turn:
+                turns.append(current_turn)
+                current_turn = [msg]
+            elif role == 'user' and current_turn:
+                turns.append(current_turn)
+                current_turn = [msg]
+            elif role == 'assistant' and has_tool_calls:
+                if current_turn:
+                    turns.append(current_turn)
+                current_turn = [msg]  # Start new turn with tool-calling assistant
+            elif role == 'tool':
+                current_turn.append(msg)  # Keep tool result with its assistant
+            elif role == 'assistant' and current_turn:
+                # Check if previous was a tool chain
+                prev_roles = [m.get('role') for m in current_turn]
+                if 'tool' in prev_roles:
+                    turns.append(current_turn)
+                    current_turn = [msg]
+                else:
+                    turns.append(current_turn)
+                    current_turn = [msg]
+            else:
+                current_turn.append(msg)
+
+        if current_turn:
+            turns.append(current_turn)
+        return turns
+
+    def _concat_turn_summaries(self, turns: list) -> str:
+        """Concatenate brief summaries of each turn."""
+        parts = []
+        for turn in turns:
+            for msg in turn:
+                role = msg.get('role', '')
+                content = msg.get('content', '')[:80]
+                if content:
+                    parts.append(f"{role}: {content}...")
+        return " | ".join(parts[:8])[:600]
+
+    def estimate_tokens(self, messages: list) -> int:
+        total = 0
+        for msg in messages:
+            total += self.backend.count_tokens_approx(msg.get('content', ''))
+            total += self.backend.count_tokens_approx(msg.get('thinking', ''))
+        return total
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 12: UI RENDERER (Full Diff Viewer + Layouts)
+# ──────────────────────────────────────────────────────────────
+
+class UIRenderer:
+    def __init__(self, config: PincerConfig):
+        self.config = config
+        self.console = Console(theme=DEEP_OCEAN, highlight=False)
+        self.user_name = config.user_name
+        self.session_start = time.time()
+        self.turn_count = 0
+        self.llm_calls = 0
+        self.commands_run = 0
+        self.files_written = 0
+        self.errors_count = 0
+        self._layout_mode = config.layout_mode
+
+    # ── Banners ──
+
+    def show_banner(self):
+        self.console.print()
+        self.console.print(Panel(
+            f"[{C['primary_br']}]🦞  P I N C E R  v{VERSION}[/{C['primary_br']}]\n"
+            f"[{C['text_dim']}]Your Autonomous Coding Companion — Blue Lobster Edition[/{C['text_dim']}]",
+            border_style=C['primary'], padding=(1, 4),
+        ))
+        self.console.print()
+
+    def show_welcome(self):
+        self.console.print(f"[{C['accent']}]Welcome to Pincer! 🦞[/{C['accent']}]")
+        self.console.print(f"[{C['text_dim']}]Type your message, or /help for commands.[/{C['text_dim']}]")
+        self.console.print()
+
+    # ── Activity Indicators ──
+
+    def show_thinking_start(self):
+        self.console.print(f"[{C['thinking']}]🦞💭 Thinking...[/{C['thinking']}]")
+
+    def show_thinking_block(self, thinking: str):
+        if not thinking.strip():
+            return
+        display = thinking
+        if len(display) > 1200:
+            display = display[:600] + f"\n... ({len(thinking)} chars) ...\n" + display[-400:]
+        self.console.print(Panel(
+            f"[{C['thinking']}]{display}[/{C['thinking']}]",
+            title=f"[{C['thinking']}]🦞💭 Thinking[/{C['thinking']}]",
+            border_style=C['thinking'], padding=(0, 1),
+        ))
+
+    def show_activity(self, activity: str):
+        labels = {
+            'thinking': ('🦞💭', C['thinking'], 'Thinking...'),
+            'planning': ('🦞📋', C['planning'], 'Planning...'),
+            'working':  ('🦞⚡', C['working'],  'Working...'),
+            'searching':('🦞🔍', C['searching'],'Searching the web...'),
+            'reading':  ('🦞📖', C['reading'],  'Reading files...'),
+            'writing':  ('🦞✏️', C['writing'],  'Writing files...'),
+            'fetching': ('🦞🌐', C['searching'],'Fetching URL...'),
+            'scraping': ('🦞🌐', C['searching'],'Scraping page (Playwright)...'),
+            'compacting':('🦞🔄',C['text_dim'], 'Compacting context...'),
+        }
+        icon, color, label = labels.get(activity, ('🦞', C['primary'], activity))
+        self.console.print(f"[{color}]{icon} {label}[/{color}]")
+
+    # ── Response Rendering ──
+
+    def show_response(self, content: str):
+        if not content.strip():
+            return
+        try:
+            md = Markdown(content)
+            self.console.print(md)
+        except Exception:
+            self.console.print(content)
+        self.console.print()
+
+    # ── Tool Call Display ──
+
+    def show_tool_call(self, tool_name: str, args: dict):
+        self.llm_calls += 1
+        icon_map = {
+            'read_file': '📖', 'write_file': '✏️', 'edit_file': '✏️',
+            'search_files': '🔍', 'list_directory': '📁', 'execute_command': '⚡',
+            'web_search': '🔍', 'fetch_url': '🌐', 'scrape_page': '🌐',
+            'ask_user': '❓', 'write_note': '📝',
+        }
+        icon = icon_map.get(tool_name, '🔧')
+        args_display = []
+        for k, v in args.items():
+            v_str = str(v)
+            if len(v_str) > 80:
+                v_str = v_str[:77] + "..."
+            args_display.append(f"{k}: {v_str}")
+        args_text = f"[{C['text_dim']}], [{C['text_dim']}]".join(args_display)
+        self.console.print(
+            f"  [{C['accent']}]{icon} {tool_name}[/{C['accent']}]"
+            f"([{C['text_dim']}]{args_text}[/{C['text_dim']}])"
+        )
+        if tool_name == 'execute_command':
+            self.commands_run += 1
+        elif tool_name in ('write_file', 'edit_file'):
+            self.files_written += 1
+
+    def show_tool_result(self, tool_name: str, result: str, duration: float = 0):
+        is_error = result.startswith("Error:") or result.startswith("BLOCKED:")
+        is_ask = result.startswith("ASK_USER:")
+        if is_ask:
+            return
+
+        # Check if result is JSON with diff (from edit_file)
+        is_diff_result = False
+        parsed = None
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict) and 'diff' in parsed:
+                is_diff_result = True
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if is_error:
+            self.errors_count += 1
+            icon = "✗"
+            color = C['error']
+            self.console.print(f"    [{color}]{icon}[/{color}] {result}")
+        elif is_diff_result and parsed:
+            self._show_diff_result(parsed, duration)
+        elif tool_name == 'execute_command' and not is_error:
+            self._show_command_result(result, duration)
+        elif tool_name == 'read_file' and not is_error:
+            self._show_file_result(result, duration)
+        elif tool_name in ('write_file', 'edit_file') and not is_error:
+            # write_file now returns JSON too
             try:
-                conv=json.loads(cp[0]); self.conn.execute("DELETE FROM conversation")
-                for item in conv:
-                    if isinstance(item,(list,tuple)) and len(item)>=2: self.save_msg(str(item[0]),str(item[1]))
-                if cp[1] and Path(cp[1]).exists(): os.chdir(cp[1])
-                self.console.print(f"  ✓ Restored step {self.al.current_step}",style="green")
-            except Exception as e: self.console.print(f"  ⚠ Restore failed: {e}",style="yellow")
-        self.al.display_plan()
-        if sys.stdin.isatty() and questionary.confirm("  Resume?",default=True).ask(): self.al.status="active"; self.al.run_loop()
-    def rollback(self):
-        if not self.al.task_id: self.console.print("  ⚠ No task.",style="yellow"); return
-        cp=self.conn.execute("SELECT id,step_index,git_commit_hash FROM checkpoints WHERE task_id=? ORDER BY id DESC LIMIT 1",(self.al.task_id,)).fetchone()
-        if not cp: self.console.print("  ⚠ No checkpoint.",style="yellow"); return
-        if cp[2] and Path(".git").exists():
-            try: subprocess.run(["git","reset","--hard",cp[2]],capture_output=True,check=True); self.console.print(f"  ✓ Rolled back to {cp[2][:8]}",style="green")
-            except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-        self.al.current_step=cp[1]; self.al._update()
-    def _check_resume(self):
-        if not sys.stdin.isatty(): return
-        r=self.conn.execute("SELECT id,goal,status,updated_at FROM tasks WHERE status IN ('paused','active','stuck') ORDER BY updated_at DESC LIMIT 1").fetchone()
-        if not r: return
-        self.console.print(f"\n  ⏸️ Resume '{r[1]}' ({r[2]}, last: {r[3]})?")
-        if questionary.confirm("  Resume?",default=True).ask(): self.resume_task(r[0])
+                wp = json.loads(result)
+                action = wp.get('action', 'Wrote')
+                lines = wp.get('lines', '?')
+                path = wp.get('path', '?')
+                self.console.print(f"    [{C['success']}]✓[/{C['success']}] {action} {path} ({lines} lines)")
+            except (json.JSONDecodeError, TypeError):
+                self.console.print(f"    [{C['success']}]✓[/{C['success']}] {result}")
+        elif tool_name == 'web_search' and not is_error:
+            self._show_search_result(result)
+        elif tool_name == 'fetch_url' and not is_error:
+            self._show_fetch_result(result)
+        elif tool_name == 'scrape_page' and not is_error:
+            self._show_fetch_result(result)
+        else:
+            display = result
+            if len(display) > 500:
+                display = display[:250] + f"\n... ({len(result)} chars) ...\n" + display[-200:]
+            icon = "✓"
+            color = C['success']
+            self.console.print(f"    [{color}]{icon}[/{color}] {display}")
+        self.console.print()
 
-    # ── #30: Session snapshots ─────────────────────────────────────────────
+    def _show_diff_result(self, parsed: dict, duration: float = 0):
+        """Show a proper unified diff with red/green highlighting — NEW FEATURE."""
+        diff_text = parsed.get('diff', '')
+        summary = parsed.get('summary', '')
+        path = parsed.get('path', '?')
 
-    def cmd_save_session(self, name="default"):
-        rows=self.conn.execute("SELECT role,content FROM conversation ORDER BY id ASC").fetchall()
-        data={"timestamp":time.time(),"model":self.model,"conversation":rows}
-        p=SESSIONS_DIR/f"{name}.json"
-        p.write_text(json.dumps(data,ensure_ascii=False)); self.console.print(f"  ✓ Session saved: {name}",style="green")
-    def cmd_load_session(self, name="default"):
-        p=SESSIONS_DIR/f"{name}.json"
-        if not p.exists(): self.console.print(f"  ⚠ No session: {name}",style="yellow"); return
+        if not diff_text:
+            self.console.print(f"    [{C['success']}]✓[/{C['success']}] {summary}")
+            return
+
+        diff_lines = diff_text.splitlines()
+        table_lines = []
+
+        for line in diff_lines:
+            if line.startswith('---') or line.startswith('+++'):
+                table_lines.append(f"[{C['text_dim']}]{line}[/{C['text_dim']}]")
+            elif line.startswith('@@'):
+                table_lines.append(f"[{C['info']}]{line}[/{C['info']}]")
+            elif line.startswith('+'):
+                table_lines.append(f"[{C['diff_add']}]{line}[/{C['diff_add']}]")
+            elif line.startswith('-'):
+                table_lines.append(f"[{C['diff_del']}]{line}[/{C['diff_del']}]")
+            else:
+                table_lines.append(f"[{C['text']}]{line}[/{C['text']}]")
+
+        content = "\n".join(table_lines)
+        dur_text = f" [{C['text_dim']}]{duration:.1f}s[/{C['text_dim']}]" if duration else ""
+
+        self.console.print(Panel(
+            content,
+            title=f"[{C['writing']}]📝 Diff: {path}[/{C['writing']}]{dur_text}",
+            border_style=C['border'], padding=(0, 1),
+        ))
+        self.console.print(f"    [{C['success']}]✓[/{C['success']}] {summary}")
+
+    def _show_command_result(self, result: str, duration: float = 0):
+        lines = result.splitlines()
+        max_show = 30
+        if len(lines) > max_show:
+            head = "\n".join(lines[:15])
+            tail = "\n".join(lines[-10:])
+            display = f"{head}\n[{C['text_muted']}]... ({len(lines) - 25} lines hidden) ...[/{C['text_muted']}]\n{tail}"
+        else:
+            display = result
+        dur_text = f" [{C['text_dim']}]{duration:.1f}s[/{C['text_dim']}]" if duration else ""
+        self.console.print(Panel(
+            f"[{C['text']}]{display}[/{C['text']}]",
+            title=f"[{C['success']}]⚡ Output[/{C['success']}]{dur_text}",
+            border_style=C['border'], padding=(0, 1),
+        ))
+
+    def _show_file_result(self, result: str, duration: float = 0):
+        lines = result.splitlines()
+        max_show = 40
+        if len(lines) > max_show:
+            display = "\n".join(lines[:20]) + f"\n[{C['text_muted']}]... ({len(lines) - 30} lines hidden) ...[/{C['text_muted']}]\n" + "\n".join(lines[-10:])
+        else:
+            display = result
+        self.console.print(Panel(
+            f"[{C['text']}]{display}[/{C['text']}]",
+            title=f"[{C['reading']}]📖 File[/{C['reading']}]",
+            border_style=C['border'], padding=(0, 1),
+        ))
+
+    def _show_search_result(self, result: str):
+        self.console.print(Panel(
+            f"[{C['text']}]{result}[/{C['text']}]",
+            title=f"[{C['searching']}]🔍 Results[/{C['searching']}]",
+            border_style=C['border'], padding=(0, 1),
+        ))
+
+    def _show_fetch_result(self, result: str):
+        if len(result) > 3000:
+            display = result[:1500] + f"\n... ({len(result)} chars) ...\n" + result[-1000:]
+        else:
+            display = result
+        self.console.print(Panel(
+            f"[{C['text']}]{display}[/{C['text']}]",
+            title=f"[{C['searching']}]🌐 Page[/{C['searching']}]",
+            border_style=C['border'], padding=(0, 1),
+        ))
+
+    def show_ask_user(self, question: str, options: list = None):
+        self.console.print()
+        if options:
+            opts_text = "\n".join(
+                f"  [{C['accent']}]{i+1}.[/{C['accent']}] {opt}" for i, opt in enumerate(options)
+            )
+            self.console.print(Panel(
+                f"[{C['text_bright']}]{question}[/{C['text_bright']}]\n\n{opts_text}",
+                title=f"[{C['warning']}]🦞❓ Question[/{C['warning']}]",
+                border_style=C['warning'], padding=(1, 2),
+            ))
+        else:
+            self.console.print(Panel(
+                f"[{C['text_bright']}]{question}[/{C['text_bright']}]",
+                title=f"[{C['warning']}]🦞❓ Question[/{C['warning']}]",
+                border_style=C['warning'], padding=(1, 2),
+            ))
+
+    # ── Error & Status ──
+
+    def show_error(self, message: str):
+        self.console.print(f"\n[{C['error']}]🦞✗ {message}[/{C['error']}]")
+        self.errors_count += 1
+
+    def show_warning(self, message: str):
+        self.console.print(f"[{C['warning']}]⚠️  {message}[/{C['warning']}]")
+
+    def show_info(self, message: str):
+        self.console.print(f"[{C['info']}]ℹ️  {message}[/{C['info']}]")
+
+    def show_success(self, message: str):
+        self.console.print(f"[{C['success']}]🦞✓ {message}[/{C['success']}]")
+
+    def show_permission_denied(self, tool_name: str):
+        self.console.print(f"[{C['text_dim']}]⊘ Permission denied for {tool_name}[/{C['text_dim']}]")
+
+    def play_sound(self, sound_type: str = 'bell'):
+        """Terminal bell notification for long-running tasks."""
+        if self.config.get('sound_notifications', True):
+            if sound_type == 'bell':
+                sys.stdout.write('\a')
+                sys.stdout.flush()
+
+    # ── Status Bar ──
+
+    def show_status_bar(self, state: str = 'idle', context_tokens: int = 0):
+        state_icons = {
+            'idle': (f'{MASCOT}💤', C['text_dim']),
+            'thinking': (f'{MASCOT}💭', C['thinking']),
+            'planning': (f'{MASCOT}📋', C['planning']),
+            'working': (f'{MASCOT}⚡', C['working']),
+            'searching': (f'{MASCOT}🔍', C['searching']),
+            'reading': (f'{MASCOT}📖', C['reading']),
+            'writing': (f'{MASCOT}✏️', C['writing']),
+            'error': (f'{MASCOT}✗', C['error']),
+            'success': (f'{MASCOT}✓', C['success']),
+        }
+        icon, color = state_icons.get(state, (MASCOT, C['primary']))
+        elapsed = int(time.time() - self.session_start)
+        ctx_ratio = context_tokens / MAX_CONTEXT_TOKENS if MAX_CONTEXT_TOKENS else 0
+        if ctx_ratio < 0.5:
+            ctx_color = C['success']
+        elif ctx_ratio < 0.75:
+            ctx_color = C['warning']
+        else:
+            ctx_color = C['error']
+        filled = int(ctx_ratio * 12)
+        ctx_bar = f"{'█' * filled}{'░' * (12 - filled)}"
+        self.console.print(Rule(
+            f"[{color}]{icon}[/{color}] │ "
+            f"[{C['text_dim']}]{self.user_name}[/{C['text_dim']}] │ "
+            f"[{ctx_color}]ctx {context_tokens:,}/{MAX_CONTEXT_TOKENS:,}[/{ctx_color}] │ "
+            f"[{C['text_dim']}]{elapsed//60}m{elapsed%60:02d}s[/{C['text_dim']}] │ "
+            f"[{C['text_dim']}]{self.config.model}[/{C['text_dim']}] │ "
+            f"[{C['text_dim']}]{self.llm_calls} calls[/{C['text_dim']}]",
+            style=C['border'], characters="─",
+        ))
+
+    # ── File Tree ──
+
+    def show_file_tree(self, path: str = None):
+        dirpath = Path(path) if path else Path.cwd()
+        if not dirpath.exists():
+            self.show_error(f"Directory not found: {dirpath}")
+            return
+        tree = Tree(f"📁 {dirpath.name}", guide_style=C['border'])
+        self._build_tree(tree, dirpath, max_depth=3, current_depth=0)
+        self.console.print(tree)
+
+    def _build_tree(self, tree, path: Path, max_depth: int, current_depth: int):
+        if current_depth >= max_depth:
+            return
         try:
-            data=json.loads(p.read_text()); self.conn.execute("DELETE FROM conversation")
-            for r,c in data.get("conversation",[]): self.save_msg(r,c)
-            self._inv_tc(); self.console.print(f"  ✓ Session loaded: {name}",style="green")
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-    def cmd_list_sessions(self):
-        if not SESSIONS_DIR.exists(): self.console.print("  No sessions.",style="dim"); return
-        ss=list(SESSIONS_DIR.glob("*.json"))
-        if not ss: self.console.print("  No sessions.",style="dim"); return
-        t=Table(title="Sessions",border_style=BLUE,padding=(0,1)); t.add_column("Name",style="bold"); t.add_column("Saved")
-        for s in ss:
-            try: d=json.loads(s.read_text()); t.add_row(s.stem,datetime.fromtimestamp(d.get("timestamp",0)).strftime("%Y-%m-%d %H:%M"))
-            except: t.add_row(s.stem,"?")
-        self.console.print(t)
-
-    # ── Slash commands ────────────────────────────────────────────────────
-
-    def cmd_model(self):
-        try: resp=ollama.list(); ml=self._parse_models(resp)
-        except Exception as e: self.err.print(f"  {e}"); return
-        if not ml: self.console.print("  No models.",style="yellow"); return
-        ch=[]; nm={}
-        for m in ml: n=m.get("model","?"); s=m.get("size",0)/(1024**3); l=f"{n} ({s:.1f}GB)"; ch.append(l); nm[l]=n
-        ch.sort(); sel=questionary.select("  Model:",choices=ch).ask()
-        if sel: self.model=nm.get(sel,sel.split("  ")[0]); self.sc("model",self.model); self.console.print(f"  ✓ {self.model}",style="green")
-    def cmd_think(self):
-        self.thinking=not self.thinking; s="on" if self.thinking else "off"; self.sc("thinking_mode",s)
-        self.console.print(f"  ✓ Thinking: {s}",style="green")
-    def cmd_clear(self): self.conn.execute("DELETE FROM conversation"); self.conn.commit(); self._inv_tc(); self.console.print("  ✓ Cleared.",style="green")
-    def cmd_compact(self): self.compact(manual=True)
-    def cmd_help(self):
-        t=Table(title="⬡ Commands",header_style="bold blue",border_style="dim",padding=(0,2))
-        t.add_column("Command",style="bold",width=16); t.add_column("Description")
-        for c,d in [("/model","Switch model"),("/think","Toggle thinking"),("/clear","Clear context"),("/compact","Compact context"),
-            ("/tools","List tools"),("/sandbox","Sandbox info"),("/undo","Undo last commit"),("/context","Context stats"),
-            ("/plan <goal>","Plan task"),("/go","Execute plan"),("/task <goal>","Plan + execute"),
-            ("/explore","Map codebase"),("/search <q>","Search code"),("/diff","Git diff"),("/blame <file>","Git blame"),
-            ("/explain <file>","#49 Explain file"),("/todo","#24 Find TODOs"),("/resolve","#26 Merge conflicts"),
-            ("/status","Task progress"),("/pause","Pause task"),("/resume","Resume task"),("/abort","Abort task"),
-            ("/notes","Self-notes"),("/compact-notes","Summarise notes"),("/cost","Cost metrics"),
-            ("/auto-approve","Toggle auto-approve"),("/health","Agent health"),("/edit-plan","Edit plan"),
-            ("/rollback","Revert checkpoint"),("/checkpoint","Save checkpoint"),("/memory","Project memory"),
-            ("/panel","Side panel"),("/export","Export conversation"),("/update","Update Pincer"),
-            ("/save [name]","#30 Save session"),("/load [name]","#30 Load session"),("/sessions","#30 List sessions"),
-            ("/architect","#29 Architect mode"),("/pair","#42 Pair programming"),("/dry-run","#36 Dry run mode"),
-            ("/notify","Test notification"),("/voice","#46 Voice input"),("/resume-int","#6 Resume interrupted"),
-            ("/issue <url>","#48 Issue→code"),("/web <url>","#28 Fetch web docs"),
-            ("/exit","Quit"),("/help","This help")]: t.add_row(c,d)
-        self.console.print(t)
-    def cmd_tools(self):
-        t=Table(title="Tools",header_style="bold blue",border_style="dim",padding=(0,2))
-        t.add_column("Tool",style="bold",width=16); t.add_column("",width=2); t.add_column("Feature")
-        for n,s,f in [("read_file","✅","#1 Syntax highlight"),("write_file","✅","#17 Multi-file"),("edit_file","✅","#19 Fuzzy match"),
-            ("edit_file_diff","✅","#19 SEARCH/REPLACE"),("execute_command","✅","#25 Hardened sandbox"),("ask_user","✅","Interactive questions"),
-            ("voice_input","✅","#46 Whisper"),("web_fetch","✅","#28 Docs fetch"),("explain","✅","#49 Explain code"),
-            ("todo_hunter","✅","#24 Find TODOs"),("resolve_conflict","✅","#26 Merge conflicts"),
-            ("blame","✅","#32 Git blame"),("search","✅","#12 Code search")]: t.add_row(n,s,f)
-        self.console.print(t)
-    def cmd_sandbox(self):
-        cwd=os.getcwd(); st="Active (sandbox-exec)" if self.st.sandbox_available else "Unavailable"
-        t=Table(title="Sandbox",show_header=False,border_style="dim",padding=(0,2))
-        t.add_column("Key",style="bold"); t.add_column("Value")
-        for k,v in [("Status",st),("CWD",cwd),("Exec","/usr/bin, /usr/local/bin, ~/.local/bin, /opt/homebrew"),("Blocked","sudo, mkfs"),("Network","Blocked (except approved)")]: t.add_row(k,v)
-        self.console.print(t)
-    def cmd_undo(self):
-        if not Path(".git").exists(): self.console.print("  ⚠ No git.",style="yellow"); return
-        try: subprocess.run(["git","reset","--hard","HEAD~1"],capture_output=True,text=True,check=True); self.console.print("  ✓ Undone.",style="green")
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-    def cmd_context(self):
-        tt=self.total_tokens(); cnt=self.msg_count(); st=self.ct(self.sys_prompt()); db=tt-st; pct=tt/MAX_TOKENS*100
-        t=Table(title="Context",show_header=False,border_style=BLUE,padding=(0,2))
-        t.add_column("Key",style="bold"); t.add_column("Value")
-        for k,v in [("Model",self.model),("Messages",str(cnt)),("System",f"{st:,}"),("Conversation",f"{db:,}"),("Total",f"{tt:,}"),("Capacity",f"{tt:,}/{MAX_TOKENS:,} ({pct:.0f}%)")]: t.add_row(k,v)
-        # #39: Context window visualizer
-        self.console.print(t)
-        self.console.print(Bar(800, width=40, color=BLUE, bgcolor="dim"))  # visual bar
-    # ── Phase 3+4 commands ─────────────────────────────────────────────────
-    def cmd_plan(self,goal):
-        if not goal: self.console.print("  /plan <goal>",style="yellow"); return
-        self.al.create_task(goal); self.console.print(f"  📋 Planning: {goal}",style="bold blue")
-        cl=self.al.ask_clarifying(goal); plan=self.al.generate_plan(goal,cl)
-        if plan: self.al.display_plan(); PLAN_FILE.parent.mkdir(parents=True,exist_ok=True); PLAN_FILE.write_text(f"# {goal}\n\n"+"\n".join(f"- [ ] {s['description']}" for s in plan))
-        else: self.console.print("  ❌ Plan failed.",style="bold red")
-    def cmd_go(self):
-        if not self.al.plan: self.console.print("  /plan first.",style="yellow"); return
-        if self.al.status not in ("planning","paused"): self.console.print(f"  Status: {self.al.status}",style="yellow"); return
-        self.al.display_plan()
-        if sys.stdin.isatty() and not questionary.confirm("  Execute?",default=True).ask(): return
-        self.al.run_loop()
-    def cmd_task(self,goal):
-        if not goal: self.console.print("  /task <goal>",style="yellow"); return
-        self.cmd_plan(goal)
-        if not self.al.plan: return
-        if sys.stdin.isatty() and questionary.confirm("  Execute?",default=True).ask(): self.al.run_loop()
-    def cmd_explore(self):
-        self.console.print("  🔍 Exploring…",style=BLUE); cwd=os.getcwd()
-        r=self.st.execute_command("find . -maxdepth 3 -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/__pycache__/*' | head -80",cwd)
-        if r.success: self.console.print(Panel(r.output[:3000],title="📁 Files",border_style=BLUE))
-        syms=self.build_rmap()
-        if syms:
-            ls=[f"  {p}: {', '.join(d[:10])}" for p,d in syms.items()]
-            self.console.print(Panel("\n".join(ls[:40]),title="🗺 Symbols",border_style="dim"))
-        for f in ["README.md","package.json","requirements.txt","Cargo.toml","go.mod"]:
-            if Path(f).exists():
-                rr=self.ft.read_file(f)
-                if rr.success: self._render_file(f,rr.output[:2000])
-        self.write_note("observation",f"Explored {cwd}"); self.console.print("  ✓ Done.",style="green")
-    def cmd_search(self,q):
-        if not q: self.console.print("  /search <query>",style="yellow"); return
-        cmd=f"rg --max-count=20 --no-heading --color=never '{q}' ." if shutil.which("rg") else f"grep -rn --max-count=20 '{q}' ."
-        r=self.st.execute_command(cmd,os.getcwd())
-        if r.success and r.output.strip(): self.console.print(Panel(r.output[:4000],title=f"🔍 {q}",border_style=BLUE))
-        else: self.console.print(f"  No results for '{q}'.",style="dim")
-    def cmd_diff(self):
-        if not Path(".git").exists(): self.console.print("  ⚠ No git.",style="yellow"); return
-        r=self.st.execute_command("git diff",os.getcwd())
-        if r.success and r.output.strip():
-            try: self.console.print(Panel(Syntax(r.output[:6000],"diff",theme="monokai",line_numbers=False),title="📊 Diff",border_style=BLUE))
-            except: self.console.print(Panel(r.output[:4000],title="📊 Diff",border_style=BLUE))
-        else: self.console.print("  No changes.",style="dim")
-    def cmd_blame(self,path):
-        if not path: self.console.print("  /blame <file>",style="yellow"); return
-        if not Path(".git").exists(): self.console.print("  ⚠ No git.",style="yellow"); return
-        r=self.st.execute_command(f"git blame {path}",os.getcwd())
-        if r.success: self.console.print(Panel(r.output[:4000],title=f"📝 Blame: {path}",border_style=BLUE))
-        else: self.console.print(f"  ❌ {r.error}",style="red")
-    def cmd_explain(self,path):
-        if not path: self.console.print("  /explain <file>",style="yellow"); return
-        r=self.ft.read_file(path)
-        if not r.success: self.console.print(f"  ❌ {r.error}",style="red"); return
-        self.console.print(Panel(r.output[:2000],title=f"📄 {path}",border_style=BLUE))
-        pr=f"Explain this code file in detail. Walk through each section.\n\n{r.output[:6000]}"
-        try:
-            with self.console.status("  [bold blue]Explaining…[/]"):
-                resp=self._run_llm_sync([{"role":"user","content":pr}])
-            self.console.print(Markdown(resp),style=""); self.write_note("observation",f"Explained {path}")
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-    def cmd_todo(self):
-        r=self.st.execute_command("grep -rn 'TODO\\|FIXME\\|HACK\\|XXX' --include='*.py' --include='*.js' --include='*.ts' --include='*.rs' --include='*.go' . | head -30",os.getcwd())
-        if r.success and r.output.strip(): self.console.print(Panel(r.output[:3000],title="📋 TODOs",border_style=BLUE))
-        else: self.console.print("  No TODOs found.",style="dim")
-    def cmd_resolve(self,path=""):
-        if not Path(".git").exists(): self.console.print("  ⚠ No git.",style="yellow"); return
-        cmd="git diff --name-only --diff-filter=U"
-        if path: cmd=f"git diff --diff-filter=U {path}"
-        r=self.st.execute_command(cmd,os.getcwd())
-        if not r.success or not r.output.strip(): self.console.print("  No conflicts.",style="dim"); return
-        files=r.output.strip().split("\n")
-        self.console.print(f"  ⚔️ Conflicts: {len(files)}",style="yellow")
-        for f in files:
-            fr=self.ft.read_file(f.strip())
-            if fr.success:
-                self.console.print(f"  📄 {f.strip()}")
-                pr=f"Resolve the merge conflicts in this file. Output the complete resolved file.\n\n{fr.output[:8000]}"
-                try:
-                    with self.console.status(f"  [bold blue]Resolving {f.strip()}…[/]"):
-                        resp=self._run_llm_sync([{"role":"user","content":pr}])
-                    self.console.print(Markdown(f"**Resolution for {f.strip()}:**\n```\n{resp[:2000]}\n```"))
-                    if questionary.confirm(f"  Apply resolution to {f.strip()}?",default=False).ask():
-                        c=re.sub(r"^```[\w]*\n","",resp); c=re.sub(r"\n```$","",c)
-                        self.ft.write_file(f.strip(),c.strip()+"\n")
-                        self._auto_commit(f"resolve: {f.strip()}")
-                except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-    def cmd_web(self,url):
-        if not url: self.console.print("  /web <url>",style="yellow"); return
-        r=self.st.execute_command(f"curl -sL --max-time 15 '{url}'",os.getcwd(),net=True)
-        if r.success:
-            clean=re.sub(r'<[^>]+>',"",r.output[:15000])
-            pr=f"Summarise the key points from this documentation page:\n\n{clean[:10000]}"
-            try:
-                with self.console.status("  [bold blue]Reading…[/]"): resp=self._run_llm_sync([{"role":"user","content":pr}])
-                self.console.print(Markdown(resp))
-            except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-        else: self.console.print(f"  ❌ Fetch failed.",style="red")
-    def cmd_voice(self):
-        try:
-            import speech_recognition as sr
-            r=sr.Recognizer()
-            with sr.Microphone() as src: self.console.print("  🎤 Listening…",style=BLUE); audio=r.listen(src,timeout=10,phrase_time_limit=30)
-            text=r.recognize_whisper(audio); self.console.print(f"  🗣️ {text}",style="blue"); return text
-        except ImportError: self.console.print("  Install: pip install SpeechRecognition pyaudio",style="yellow"); return None
-        except Exception as e: self.console.print(f"  ❌ {e}",style="red"); return None
-    def cmd_issue(self,url):
-        if not url: self.console.print("  /issue <url>",style="yellow"); return
-        r=self.st.execute_command(f"curl -sL --max-time 15 '{url}'",os.getcwd(),net=True)
-        if r.success:
-            pr=f"This is a GitHub issue. Create a plan to solve it:\n\n{r.output[:8000]}"
-            try:
-                with self.console.status("  [bold blue]Reading issue…[/]"): resp=self._run_llm_sync([{"role":"user","content":pr}])
-                self.console.print(Markdown(resp))
-                if questionary.confirm("  Create task from this?",default=True).ask(): self.cmd_task(resp[:200])
-            except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-        else: self.console.print("  ❌ Fetch failed.",style="red")
-    def cmd_status(self):
-        if not self.al.plan: self.console.print("  No task.",style="dim"); return
-        el=int((time.time()-self.al.start_time)/60) if self.al.start_time else 0
-        d=sum(1 for s in self.al.plan if s["status"]=="done")
-        t=Table(title="Status",show_header=False,border_style=BLUE,padding=(0,2))
-        t.add_column("Key",style="bold"); t.add_column("Value")
-        for k,v in [("Status",self.al.status),("Progress",f"{d}/{len(self.al.plan)}"),("Step",str(self.al.current_step+1) if self.al.current_step<len(self.al.plan) else "done"),
-            ("Elapsed",f"{el}m"),("Commands",str(self.al.shell_count)),("Writes",str(self.al.write_count)),
-            ("LLM",str(self.al.llm_calls)),("Auto","🟢" if self.al.auto_approve else "🔴"),("Health",f"{self.al.health():.0%}")]: t.add_row(k,v)
-        self.console.print(t); self.al.display_plan()
-    def cmd_pause(self):
-        if self.al.status!="active": self.console.print("  ⚠ No task.",style="yellow"); return
-        self.al.pause()
-    def cmd_resume(self): self.resume_task()
-    def cmd_abort(self):
-        if not self.al.task_id: self.console.print("  ⚠ No task.",style="yellow"); return
-        if not sys.stdin.isatty() or questionary.confirm("  Abort?",default=False).ask(): self.al.abort()
-    def cmd_notes(self):
-        rows=self.conn.execute("SELECT category,content,timestamp FROM notes ORDER BY id DESC LIMIT 10").fetchall()
-        if not rows: self.console.print("  No notes.",style="dim"); return
-        ic={"success":"✅","error":"❌","observation":"👁","preference":"⚙️","pattern":"🔄"}
-        t=Table(title="Notes",header_style="bold blue",border_style="dim",padding=(0,1))
-        t.add_column("",width=2); t.add_column("Cat",width=12); t.add_column("Content"); t.add_column("Time",width=16)
-        for r in rows: t.add_row(ic.get(r[0],"📝"),r[0],r[1][:120],str(r[2]) if r[2] else "")
-        self.console.print(t)
-    def cmd_compact_notes(self):
-        rows=self.conn.execute("SELECT id,category,content FROM notes ORDER BY id ASC").fetchall()
-        if len(rows)<5: self.console.print("  Need ≥ 5.",style="yellow"); return
-        text="\n".join(f"{r[1]}: {r[2]}" for r in rows)
-        try:
-            with self.console.status("  [bold blue]Compacting…[/]"): sm=self._run_llm_sync([{"role":"user","content":f"Key facts:\n\n{text}"}])
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red"); return
-        ids=[r[0] for r in rows]; ph=",".join("?" for _ in ids)
-        self.conn.execute(f"DELETE FROM notes WHERE id IN ({ph})",ids)
-        self.conn.execute("INSERT INTO notes (category,content) VALUES (?,?)",("pattern",sm[:2000])); self.conn.commit()
-        self.console.print(f"  ✓ {len(rows)} → 1 summary",style="green")
-    def cmd_cost(self):
-        if not self.al.task_id: self.console.print("  No task.",style="dim"); return
-        self.console.print(f"  💰 {self.al.cost()}",style=BLUE)
-    def cmd_auto_approve(self):
-        self.al.auto_approve=not self.al.auto_approve
-        self.console.print(f"  ✓ Auto: {'🟢 ON' if self.al.auto_approve else '🔴 OFF'}",style="green")
-    def cmd_health(self):
-        h=self.al.health(); c="green" if h>.6 else ("yellow" if h>.3 else "red")
-        t=Table(title="Health",show_header=False,border_style=c,padding=(0,2))
-        t.add_column("Key",style="bold"); t.add_column("Value")
-        t.add_row("Score",f"[{c}]{h:.0%}[/{c}]"); t.add_row("Failures",str(self.al.consec_fail))
-        t.add_row("Shell",f"{self.al.shell_count}/{MAX_SHELL_PER_TASK}")
-        t.add_row("Writes",f"{self.al.write_count}/{MAX_WRITES_PER_TASK}")
-        t.add_row("rm",f"{self.al.rm_count}/{MAX_RM_PER_TASK}")
-        self.console.print(t)
-    def cmd_edit_plan(self):
-        if not self.al.plan: self.console.print("  No plan.",style="yellow"); return
-        ed=os.environ.get("EDITOR","nano")
-        PLAN_FILE.parent.mkdir(parents=True,exist_ok=True)
-        PLAN_FILE.write_text("\n".join(f"- [ ] {s['description']}" for s in self.al.plan))
-        try:
-            subprocess.run([ed,str(PLAN_FILE)])
-            np=[]
-            for line in PLAN_FILE.read_text().strip().split("\n"):
-                m=re.match(r"-\s+\[[ x]\]\s+(.+)",line)
-                if m: np.append({"step":len(np)+1,"description":m.group(1),"status":"pending"})
-            if np: self.al.plan=np; self.al._update()
-            self.console.print(f"  ✓ Updated ({len(np)} steps).",style="green")
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-    def cmd_checkpoint(self): self.save_cp()
-    def cmd_rollback(self): self.rollback()
-    def cmd_memory(self):
-        t=Table(title="Memory",show_header=False,border_style=BLUE,padding=(0,2))
-        t.add_column("Key",style="bold"); t.add_column("Value")
-        t.add_row("File","✓" if self._memory else "none")
-        if self._memory: t.add_row("Content",self._memory[:500])
-        for mf in MEMORY_FILES: t.add_row(mf,"✓" if Path(mf).exists() else "—")
-        self.console.print(t)
-    def cmd_panel(self):
-        cwd=os.getcwd(); panels=[]
-        tr=self.st.execute_command("find . -maxdepth 2 -not -path '*/node_modules/*' -not -path '*/.git/*' | head -40",cwd)
-        if tr.success: panels.append(Panel(tr.output[:1500],title="📁 Files",border_style="dim"))
-        if self.al.plan:
-            d=sum(1 for s in self.al.plan if s["status"]=="done")
-            pt="\n".join(f"{'✅' if s['status']=='done' else '⬜'} {s['step']}. {s['description']}" for s in self.al.plan)
-            panels.append(Panel(pt,title=f"📋 Plan ({d}/{len(self.al.plan)})",border_style=BLUE))
-        rows=self.conn.execute("SELECT tool_name,command,status FROM tool_history ORDER BY id DESC LIMIT 5").fetchall()
-        if rows: panels.append(Panel("\n".join(f"{'✓' if r[2]=='success' else '✗'} {r[0]}: {r[1][:50]}" for r in rows),title="📜 History",border_style="dim"))
-        if not panels: self.console.print("  No data.",style="dim"); return
-        self.console.print(Columns(panels,width=60))
-    def cmd_export(self):
-        rows=self.conn.execute("SELECT role,content,created_at FROM conversation ORDER BY id ASC").fetchall()
-        if not rows: self.console.print("  Nothing.",style="yellow"); return
-        out=f"# Pincer Export\n\n*{time.strftime('%Y-%m-%d %H:%M')}*\n\n---\n\n"
-        for role,content,ts in rows:
-            ic={"user":"👤","assistant":"🤖","system":"⚙️","summary":"📝"}.get(role,"•")
-            out+=f"### {ic} {role.title()} _{ts}_\n\n{content}\n\n---\n\n"
-        Path("pincer-export.md").write_text(out,encoding="utf-8")
-        self.console.print(f"  ✓ Exported.",style="green")
-    def cmd_update(self):
-        self.console.print("  🔄 Updating…",style=BLUE); repo=PINCER_DIR/"repo"
-        if not repo.exists(): self.console.print("  ⚠ No repo.",style="yellow"); return
-        try:
-            subprocess.run(["git","pull"],cwd=str(repo),check=True,capture_output=True)
-            vp=str(PINCER_DIR/"venv"/"bin"/"pip")
-            if Path(vp).exists(): subprocess.run([vp,"install","-r",str(repo/"requirements.txt"),"--quiet"],check=True)
-            self.console.print("  ✓ Updated.",style="green")
-        except Exception as e: self.console.print(f"  ❌ {e}",style="bold red")
-    def cmd_architect(self):
-        self.al.architect_mode=not self.al.architect_mode
-        self.console.print(f"  ✓ Architect: {'🟢 ON' if self.al.architect_mode else '🔴 OFF'}",style="green")
-    def cmd_pair(self):
-        self.al.pair_mode=not self.al.pair_mode
-        self.console.print(f"  ✓ Pair: {'🟢 ON (confirm each step)' if self.al.pair_mode else '🔴 OFF'}",style="green")
-    def cmd_dryrun(self):
-        self._dry_run=not self._dry_run
-        self.console.print(f"  ✓ Dry-run: {'🟢 ON (no writes)' if self._dry_run else '🔴 OFF'}",style="green")
-    def cmd_notify_test(self):
-        self._notify("Test notification from Pincer 🔔"); self.console.print("  ✓ Sent.",style="green")
-    def _exit(self): self.console.print("  👋 Goodbye.",style=BLUE); self.cleanup(); sys.exit(0)
-
-    def handle_cmd(self,inp):
-        ps=inp.strip().split(None,1); cmd=ps[0].lower(); arg=ps[1] if len(ps)>1 else ""
-        wa={"/plan":self.cmd_plan,"/task":self.cmd_task,"/search":self.cmd_search,"/blame":self.cmd_blame,"/explain":self.cmd_explain,"/resolve":self.cmd_resolve,"/web":self.cmd_web,"/issue":self.cmd_issue,"/save":self.cmd_save_session,"/load":self.cmd_load_session}
-        na={"/model":self.cmd_model,"/think":self.cmd_think,"/clear":self.cmd_clear,"/compact":self.cmd_compact,"/help":self.cmd_help,"/tools":self.cmd_tools,"/sandbox":self.cmd_sandbox,"/undo":self.cmd_undo,"/context":self.cmd_context,
-            "/go":self.cmd_go,"/explore":self.cmd_explore,"/diff":self.cmd_diff,"/todo":self.cmd_todo,"/status":self.cmd_status,"/pause":self.cmd_pause,"/resume":self.cmd_resume,"/abort":self.cmd_abort,"/notes":self.cmd_notes,"/compact-notes":self.cmd_compact_notes,"/cost":self.cmd_cost,"/auto-approve":self.cmd_auto_approve,"/health":self.cmd_health,"/edit-plan":self.cmd_edit_plan,"/rollback":self.cmd_rollback,"/checkpoint":self.cmd_checkpoint,"/memory":self.cmd_memory,"/panel":self.cmd_panel,"/export":self.cmd_export,"/update":self.cmd_update,
-            "/architect":self.cmd_architect,"/pair":self.cmd_pair,"/dry-run":self.cmd_dryrun,"/notify":self.cmd_notify_test,"/voice":self.cmd_voice,"/resume-int":self.cmd_resume_interrupt,"/sessions":self.cmd_list_sessions,"/exit":self._exit}
-        if cmd in wa: wa[cmd](arg)
-        elif cmd in na: na[cmd]()
-        else: self.console.print(f"  Unknown: {cmd} /help",style="yellow")
-
-    def cleanup(self):
-        self.watcher.stop()
-        if self._loop and not self._loop.is_closed():
-            try: self._loop.close()
-            except: pass
-        if self.conn:
-            try: self.conn.close()
-            except: pass
-
-    def _validate(self):
-        if not self.check_ollama(): self.console.print("❌ Install: brew install ollama",style="bold red"); sys.exit(1)
-        if not self.check_server(): self.console.print("⚠ Start: ollama serve",style="bold red"); sys.exit(1)
-        if not self.check_model(self.model): self.console.print(f"  ⚠ Pulling {self.model}…",style="yellow"); self.pull_model(self.model)
-    def _load_memory(self):
-        for mf in MEMORY_FILES:
-            p=Path(mf)
-            if p.exists(): self._memory=p.read_text(encoding="utf-8",errors="replace")[:4000]; break
-
-    # ── Main REPL ─────────────────────────────────────────────────────────
-
-    def run(self):
-        PINCER_DIR.mkdir(parents=True,exist_ok=True); self.setup_db()
-        if self.gc("user_name") is None: self.wizard()
-        else: self.load_config(); self.console.print(BANNER,style=""); mc=self.msg_count(); tt=self.total_tokens(); self.console.print(f"  {self.model} | {self.user_name} | {self.lang} | {mc} msgs ({tt/1000:.1f}K tok)",style="dim")
-        self._validate(); self._load_memory(); self.watcher.start()  # #39
-        self.session=PromptSession(history=FileHistory(str(HISTORY_PATH)),auto_suggest=AutoSuggestFromHistory(),completer=LazyFileCompleter())
-        _o=signal.getsignal(signal.SIGINT)
-        def _si(s,f):
-            if self._gen: self._gen=False
-            elif self.al.status=="active": self.al.pause()
-            else: raise KeyboardInterrupt
-        signal.signal(signal.SIGINT,_si)
-        self._check_resume()
-        while True:
-            try:
-                ps=f" {self.user_name} ❯ " if self.user_name else " ❯ "
-                ui=self.session.prompt(HTML(f"<style fg='ansiblue'>{ps}</style>"),bottom_toolbar=self._sbar)
-                s=ui.strip()
-                if not s: continue
-                # #39: Check file watcher
-                changes=self.watcher.drain()
-                if changes:
-                    for fp,evt in changes[:5]:
-                        self.console.print(f"  📝 File {evt}: {fp}",style="dim blue")
-                        self.write_note("observation",f"File {evt}: {fp}")
-                        self._rmap=None  # invalidate repomap cache
-                if s.startswith("/"): self.handle_cmd(s); continue
-                cls=self.router.classify(s)
-                if cls.intent=="chat":
-                    self.auto_compact(); self.save_msg("user",s); ms=self.get_msgs()
-                    n=self.rel_notes(s)
-                    if n: ms.insert(1,{"role":"system","content":n})
-                    self.console.print(); resp=self.stream(ms); self.console.print()
-                    if resp.strip(): self.save_msg("assistant",resp)
-                else: self.handle_tool(s,cls.intent,cls.params)
-            except KeyboardInterrupt:
-                if not self._gen: self.console.print()
+            items = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except PermissionError:
+            return
+        skip = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.tox',
+                '.mypy_cache', '.pytest_cache', '.ruff_cache', 'dist', 'build', '.eggs'}
+        for item in items:
+            if item.name.startswith('.') and item.name not in ('.env', '.gitignore', '.pincer'):
                 continue
-            except EOFError: self.console.print("\n  👋 Goodbye.",style=BLUE); self.cleanup(); sys.exit(0)
-        signal.signal(signal.SIGINT,_o)
+            if item.name in skip:
+                continue
+            if item.is_dir():
+                branch = tree.add(f"📁 {item.name}/")
+                self._build_tree(branch, item, max_depth, current_depth + 1)
+            else:
+                icon = {"py": "🐍", "js": "📜", "ts": "📜", "md": "📄",
+                        "json": "📋", "yaml": "📋", "yml": "📋", "toml": "📋",
+                        "rs": "🦀", "go": "🔵", "rb": "💎"}.get(item.suffix.lstrip('.'), "📄")
+                size = ""
+                try:
+                    st = item.stat().st_size
+                    size = f" [{C['text_muted']}]{st//1024}KB[/{C['text_muted']}]" if st > 1024 else f" [{C['text_muted']}]{st}B[/{C['text_muted']}]"
+                except Exception:
+                    pass
+                tree.add(f"{icon} {item.name}{size}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ── Sidebar Layout ──
 
-def build_parser():
-    p=argparse.ArgumentParser(prog="pincer",description="⬡ Pincer — local AI assistant")
-    p.add_argument("--model",metavar="M",help="Model"); p.add_argument("--think",action="store_true",help="Thinking mode")
-    p.add_argument("--clear",action="store_true",help="Clear history"); p.add_argument("--reset",action="store_true",help="Delete data")
-    p.add_argument("--dry-run",action="store_true",help="#36 No writes")  # #36
-    p.add_argument("--architect",action="store_true",help="#29 Plan only")  # #29
-    p.add_argument("--pair",action="store_true",help="#42 Confirm each step")  # #42
-    return p
+    def show_sidebar(self, plan: list = None, current_step: int = 0):
+        """Show file tree + plan sidebar (for panel layout mode)."""
+        layout = Layout()
+        layout.split_column(
+            Layout(name="files", ratio=1),
+            Layout(name="plan", size=10),
+        )
 
-def main():
-    parser=build_parser(); args=parser.parse_args()
-    if args.reset:
-        if PINCER_DIR.exists(): shutil.rmtree(PINCER_DIR)
-        print("  ✓ Deleted."); return
-    app=PincerApp()
-    if args.model: app.model=args.model
-    if args.think: app.thinking=True
-    if args.dry_run: app._dry_run=True
-    if args.architect: app.al.architect_mode=True
-    if args.pair: app.al.pair_mode=True
-    try: app.run()
-    except KeyboardInterrupt: app.console.print("\n  👋 Goodbye.",style=BLUE); app.cleanup()
-    except Exception as e: Console(stderr=True).print(f"  ❌ Fatal: {e}",style="bold red"); app.cleanup(); sys.exit(1)
+        # File tree
+        cwd = Path.cwd()
+        tree = Tree(f"📁 {cwd.name}", guide_style=C['border'])
+        self._build_tree(tree, cwd, max_depth=2, current_depth=0)
+        layout["files"].update(Panel(tree, title="📁 Files", border_style=C['border']))
 
-if __name__=="__main__": main()
+        # Plan
+        if plan:
+            plan_lines = []
+            for i, step in enumerate(plan):
+                if i < current_step:
+                    icon = f"[{C['success']}]✓[/{C['success']}]"
+                elif i == current_step:
+                    icon = f"[{C['primary_br']}]→[/{C['primary_br']}]"
+                else:
+                    icon = f"[{C['text_muted']}]○[/{C['text_muted']}]"
+                plan_lines.append(f" {icon} {i+1}. {step[:40]}")
+            plan_text = "\n".join(plan_lines)
+            layout["plan"].update(Panel(plan_text, title="📋 Plan", border_style=C['planning']))
+        else:
+            layout["plan"].update(Panel("[dim]No active plan[/dim]", title="📋 Plan", border_style=C['border']))
+
+        self.console.print(layout)
+
+    # ── Plan Display ──
+
+    def show_plan(self, plan: list, current_step: int = 0):
+        lines = []
+        for i, step in enumerate(plan):
+            if i < current_step:
+                icon = f"[{C['success']}]✓[/{C['success']}]"
+            elif i == current_step:
+                icon = f"[{C['primary_br']}]→[/{C['primary_br']}]"
+            else:
+                icon = f"[{C['text_muted']}]○[/{C['text_muted']}]"
+            lines.append(f"  {icon} {i+1}. {step}")
+        self.console.print(Panel(
+            "\n".join(lines),
+            title=f"[{C['planning']}]🦞📋 Plan ({len(plan)} steps)[/{C['planning']}]",
+            border_style=C['planning'], padding=(0, 1),
+        ))
+
+    # ── Task Summary ──
+
+    def show_task_summary(self, plan: list, current_step: int, elapsed: float, stats: dict):
+        completed = current_step
+        total = len(plan)
+        self.console.print()
+        self.console.print(Panel(
+            f"[{C['success']}]🦞✓ Task Complete![/{C['success']}]\n\n"
+            f"  Steps completed: [{C['text_bright']}]{completed}/{total}[/{C['text_bright']}]\n"
+            f"  Time elapsed:    [{C['text_bright']}]{elapsed/60:.1f} minutes[/{C['text_bright']}]\n"
+            f"  LLM calls:       [{C['text_bright']}]{stats.get('llm_calls', 0)}[/{C['text_bright']}]\n"
+            f"  Commands run:    [{C['text_bright']}]{stats.get('commands', 0)}[/{C['text_bright']}]\n"
+            f"  Files written:   [{C['text_bright']}]{stats.get('writes', 0)}[/{C['text_bright']}]\n"
+            f"  Errors:          [{C['text_bright']}]{stats.get('errors', 0)}[/{C['text_bright']}]",
+            border_style=C['success'], padding=(1, 2),
+        ))
+        self.console.print()
+        self.play_sound('bell')
+
+    # ── Help ──
+
+    def show_help(self):
+        help_table = Table(
+            title="🦞 Pincer Commands", show_header=True,
+            border_style=C['border'], title_style=C['primary_br'],
+        )
+        help_table.add_column("Command", style=C['accent'], width=22)
+        help_table.add_column("Description", style=C['text'], width=50)
+        commands = [
+            ("/task <goal>", "Start autonomous task mode"),
+            ("/plan <goal>", "Generate a plan without executing"),
+            ("/search <query>", "Search the web"),
+            ("/model [name]", "Show or switch model"),
+            ("/think <on|off|auto>", "Toggle thinking mode"),
+            ("/trust <level>", "Change trust level"),
+            ("/layout <mode>", "Switch layout (stream|panel|compact)"),
+            ("/compact", "Force context compaction"),
+            ("/checkpoint", "Save a checkpoint"),
+            ("/rollback", "Rollback to last checkpoint"),
+            ("/notes", "View agent self-notes"),
+            ("/files", "Show file tree"),
+            ("/sessions", "List conversation sessions"),
+            ("/export [fmt]", "Export session (md|json)"),
+            ("/context", "Preview current context window"),
+            ("/mcp <add|list|call>", "MCP server management"),
+            ("/config", "Show current configuration"),
+            ("/doctor", "Run diagnostics"),
+            ("/stats", "Show session statistics"),
+            ("/help", "Show this help"),
+            ("/exit", "Exit Pincer"),
+        ]
+        for cmd, desc in commands:
+            help_table.add_row(cmd, desc)
+        self.console.print(help_table)
+
+    def show_keybindings(self):
+        kb_table = Table(
+            title="⌨️  Key Bindings", show_header=True,
+            border_style=C['border'], title_style=C['primary_br'],
+        )
+        kb_table.add_column("Key", style=C['accent'], width=25)
+        kb_table.add_column("Action", style=C['text'], width=45)
+        bindings = [
+            ("Enter", "Send message"),
+            ("Up/Down", "Navigate input history"),
+            ("Ctrl+C", "Cancel current operation"),
+            ("Tab", "Autocomplete commands"),
+        ]
+        for key, action in bindings:
+            kb_table.add_row(key, action)
+        self.console.print(kb_table)
+
+    # ── Stats & Context Preview ──
+
+    def show_stats(self):
+        elapsed = int(time.time() - self.session_start)
+        self.console.print(Panel(
+            f"[{C['text_bright']}]Session Statistics[/{C['text_bright']}]\n\n"
+            f"  Duration:     [{C['accent']}]{elapsed//60}m {elapsed%60}s[/{C['accent']}]\n"
+            f"  LLM calls:   [{C['accent']}]{self.llm_calls}[/{C['accent']}]\n"
+            f"  Commands:    [{C['accent']}]{self.commands_run}[/{C['accent']}]\n"
+            f"  Files:       [{C['accent']}]{self.files_written}[/{C['accent']}]\n"
+            f"  Errors:      [{C['accent']}]{self.errors_count}[/{C['accent']}]\n"
+            f"  Turn count:  [{C['accent']}]{self.turn_count}[/{C['accent']}]",
+            border_style=C['border'], padding=(1, 2),
+        ))
+
+    def show_context_preview(self, messages: list, total_tokens: int):
+        """Show a preview of what's in the context window — NEW FEATURE."""
+        sections = []
+        for msg in messages:
+            role = msg.get('role', '?')
+            content = msg.get('content', '')
+            has_tc = 'tool_calls' in msg and msg['tool_calls']
+            token_est = max(1, len(content) // 4)
+            if role == 'system':
+                icon = "📋"
+            elif role == 'user':
+                icon = "👤"
+            elif role == 'assistant':
+                icon = "🦞"
+            elif role == 'tool':
+                icon = "🔧"
+            else:
+                icon = "❓"
+            preview = content[:80].replace('\n', ' ')
+            tc_mark = " [+tools]" if has_tc else ""
+            sections.append(f"  {icon} [{C['text_dim']}]{role}[/{C['text_dim']}] ({token_est}t{tc_mark}): {preview}...")
+
+        ctx_ratio = total_tokens / MAX_CONTEXT_TOKENS
+        if ctx_ratio < 0.5:
+            ctx_color = C['success']
+        elif ctx_ratio < 0.75:
+            ctx_color = C['warning']
+        else:
+            ctx_color = C['error']
+
+        self.console.print(Panel(
+            "\n".join(sections[:15]) + (f"\n\n  ... {len(messages) - 15} more messages" if len(messages) > 15 else ""),
+            title=f"[{ctx_color}]📋 Context Preview ({total_tokens:,}/{MAX_CONTEXT_TOKENS:,} tokens)[/{ctx_color}]",
+            border_style=C['border'], padding=(0, 1),
+        ))
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 13: THINKING TAG PARSER
+# ──────────────────────────────────────────────────────────────
+
+class ThinkParser:
+    def __init__(self):
+        self.state = 'outside'
+        self.tag_buf = ''
+        self.content_buf = ''
+        self.thinking = ''
+        self.response = ''
+
+    def feed(self, text: str) -> list:
+        results = []
+        for char in text:
+            if self.state == 'outside':
+                if char == '<':
+                    self.state = 'in_tag'
+                    self.tag_buf = '<'
+                else:
+                    self.content_buf += char
+            elif self.state == 'in_tag':
+                self.tag_buf += char
+                if self.tag_buf == THINK_OPEN[:len(self.tag_buf)]:
+                    if len(self.tag_buf) == len(THINK_OPEN):
+                        if self.content_buf:
+                            results.append(('response', self.content_buf))
+                            self.response += self.content_buf
+                            self.content_buf = ''
+                        self.state = 'inside'
+                        self.tag_buf = ''
+                elif not THINK_OPEN.startswith(self.tag_buf):
+                    self.content_buf += self.tag_buf
+                    self.tag_buf = ''
+                    self.state = 'outside'
+            elif self.state == 'inside':
+                if char == '<':
+                    self.state = 'in_close_tag'
+                    self.tag_buf = '<'
+                else:
+                    self.content_buf += char
+            elif self.state == 'in_close_tag':
+                self.tag_buf += char
+                if self.tag_buf == THINK_CLOSE[:len(self.tag_buf)]:
+                    if len(self.tag_buf) == len(THINK_CLOSE):
+                        if self.content_buf:
+                            results.append(('thinking', self.content_buf))
+                            self.thinking += self.content_buf
+                            self.content_buf = ''
+                        self.state = 'outside'
+                        self.tag_buf = ''
+                elif not THINK_CLOSE.startswith(self.tag_buf):
+                    self.content_buf += self.tag_buf
+                    self.tag_buf = ''
+                    self.state = 'inside'
+
+        if self.state == 'outside' and self.content_buf:
+            results.append(('response', self.content_buf))
+            self.response += self.content_buf
+            self.content_buf = ''
+        return results
+
+    def flush(self) -> list:
+        results = []
+        if self.content_buf:
+            if self.state in ('inside', 'in_close_tag'):
+                results.append(('thinking', self.content_buf))
+                self.thinking += self.content_buf
+            else:
+                results.append(('response', self.content_buf))
+                self.response += self.content_buf
+            self.content_buf = ''
+        if self.tag_buf:
+            if self.state in ('inside', 'in_close_tag'):
+                results.append(('thinking', self.tag_buf))
+                self.thinking += self.tag_buf
+            else:
+                results.append(('response', self.tag_buf))
+                self.response += self.tag_buf
+            self.tag_buf = ''
+        return results
+
+
+# ──────────────────────────────────────────────────────────────
+# SECTION 14: AGENT LOOP (ReAct Pattern — All Bugs Fixed)
+# ──────────────────────────────────────────────────────────────
+
+class AgentLoop:
+    def __init__(self, config, db, backend, tools, permissions, context, memory, ui):
+        self.config = config
+        self.db = db
+        self.backend = backend
+        self.tools = tools
+        self.permissions = permissions
+        self.context = context
+        self.memory = memory
+        self.ui = ui
+        self.conversation_messages = []
+        self.conv_id = None
+        self._interrupted = False
+
+    def new_conversation(self, title=""):
+        self.conv_id = self.db.create_conversation(title)
+        self.conversation_messages = []
+
+    def load_conversation(self, conv_id):
+        self.conv_id = conv_id
+        raw_msgs = self.db.get_messages(conv_id)
+        self.conversation_messages = []
+        for role, content, thinking, tool_calls, tool_name in raw_msgs:
+            msg = {'role': role, 'content': content}
+            if thinking:
+                msg['thinking'] = thinking
+            if tool_calls:
+                try:
+                    msg['tool_calls'] = json.loads(tool_calls)
+                except Exception:
+                    pass
+            self.conversation_messages.append(msg)
+
+    def run(self, user_input: str) -> str:
+        """Run the agent loop — all 6 bugs fixed."""
+        self._interrupted = False
+        self.ui.turn_count += 1
+
+        self.db.add_message(self.conv_id, 'user', user_input)
+        self.conversation_messages.append({'role': 'user', 'content': user_input})
+
+        final_response = ""
+
+        for turn in range(MAX_TURNS):
+            if self._interrupted:
+                final_response = "[Interrupted]"
+                break
+
+            messages = self.context.assemble_context(self.conversation_messages)
+            token_est = self.context.estimate_tokens(messages)
+            if token_est >
